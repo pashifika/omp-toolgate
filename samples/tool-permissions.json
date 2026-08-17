@@ -1,0 +1,222 @@
+// omp-toolgate — a baseline tool_permissions policy.
+//
+// Copy this file to ~/.omp/agent/tool-permissions.json. It is usable unedited,
+// and it is meant to be trimmed: see "If confirmations get noisy" below. This is
+// a Zed `agent.tool_permissions` block, so the same content also works pasted
+// into ~/.config/zed/settings.json under "agent".
+//
+// WHAT THIS IS NOT. It is a starting point, not a guarantee. Everything below is
+// pattern matching over the strings omp-toolgate can see, so a program that
+// derives its target at runtime is out of reach by construction. Read
+// "Known limits" in the README before trusting any of it.
+//
+// POSTURE: allow by default, confirm what is hard to undo or moves credentials.
+// There is exactly one "deny" (`computer`). A policy that refuses often is a
+// policy that gets switched off, and a confirmation you can answer is worth more
+// than a wall you route around.
+//
+// IF CONFIRMATIONS GET NOISY, delete in this order:
+//   1. `delete_path.default` — every delete tool call asks, build output included.
+//      Its `always_confirm` list is what keeps credentials protected after you
+//      relax the default, so relax the default and keep the list.
+//   2. `terminal`'s package-manager rule (`npm install` and friends).
+//   3. `terminal`'s `npx` / `bunx` / `dlx` rule.
+//   4. `terminal`'s interpreter rule, if you run `node -e` all day.
+//   5. `read_file`'s credential patterns, if a tool you use reads `.env` on
+//      every call. This is the last one to go: confirming a write to a private
+//      key while allowing a read of it protects nothing.
+// The `{ "scope": "outside" }` rules are the boundary omp itself does not have.
+// Delete them only if you routinely write outside the repository you are in.
+//
+// SEARCH IS NOT GATED. `grep` and `find_path` carry no rules here, and a search
+// is a real read channel: grep output contains the matching lines. Confirming
+// every search is the fastest way to make a gate unbearable, so it is left to
+// you. To add it (both the pattern text and each search root are matched):
+//   "grep": { "always_confirm": [{ "pattern": "(^|/)\\.env" }] }
+//
+// PLAIN `curl` AND `wget` FETCHES ARE ALLOWED, deliberately. Uploads (`-T`,
+// `--upload-file`, an `@file` request body) and piping a download into an
+// interpreter are confirmed, because those are the exfiltration and
+// remote-code shapes. A plain fetch is also the most ordinary command in a
+// developer session, and omp's own `fetch` and `web_search` tools cover the same
+// ground under their own names. To confirm them anyway, add to `terminal`:
+//   { "pattern": "\\b(curl|wget)\\b" }
+//
+// MCP TOOLS ARE NOT COVERED: their names depend on the servers you connect.
+// The key is `mcp:<server>:<tool>`, and omp's own `mcp__server__tool` spelling
+// is accepted too. Every string argument of an MCP call is offered as an input,
+// so one pattern can match any of them:
+//   "mcp:context7:query-docs": { "default": "confirm" }
+//
+// ALSO NOT COVERED: `fetch`, `skill` and `spawn_agent` keep the global default.
+// `eval`, `browser` and `computer` carry no matchable input at all, which is why
+// they appear here with a `default` and nothing else.
+//
+// COMMENTS DO NOT SURVIVE. Answering an approval prompt with
+// "Always allow (global)" re-serializes this file as plain JSON, and every
+// comment above and below is gone. Keep an unedited copy, or prefer the
+// "this project" choice, which writes `<project_root>/.omp/tool-permissions.json`
+// instead. Never symlink this file to your Zed settings.json: the first
+// write-back would rewrite that file as plain JSON as well.
+{
+  "default": "allow",
+  "tools": {
+    // ---------------------------------------------------------------------
+    // The mutating family. `outside` is the project-root boundary; the
+    // patterns are the credential paths a mistake there is unrecoverable.
+    // ---------------------------------------------------------------------
+    "write_file": {
+      "default": "allow",
+      "always_confirm": [
+        { "scope": "outside" },
+        { "pattern": "(^|/)\\.(ssh|aws|gnupg|kube|azure)(/|$)" },
+        { "pattern": "(^|/)\\.config/(gcloud|gh)(/|$)" },
+        { "pattern": "(^|/)(\\.netrc|\\.git-credentials|\\.npmrc|\\.pypirc)$" },
+        { "pattern": "(^|/)\\.docker/config\\.json$" },
+        { "pattern": "(^|/)\\.env(?:\\.(local|dev|development|test|staging|prod|production))?$" },
+        { "pattern": "(^|/)(secrets?|credentials?)(/|$)" },
+        { "pattern": "\\.(pem|key|p12|pfx)$" }
+      ]
+    },
+    "edit_file": {
+      "default": "allow",
+      "always_confirm": [
+        { "scope": "outside" },
+        { "pattern": "(^|/)\\.(ssh|aws|gnupg|kube|azure)(/|$)" },
+        { "pattern": "(^|/)\\.config/(gcloud|gh)(/|$)" },
+        { "pattern": "(^|/)(\\.netrc|\\.git-credentials|\\.npmrc|\\.pypirc)$" },
+        { "pattern": "(^|/)\\.docker/config\\.json$" },
+        { "pattern": "(^|/)\\.env(?:\\.(local|dev|development|test|staging|prod|production))?$" },
+        { "pattern": "(^|/)(secrets?|credentials?)(/|$)" },
+        { "pattern": "\\.(pem|key|p12|pfx)$" }
+      ]
+    },
+    // Every delete tool call confirms. The list below is not redundant: it is
+    // what still protects credentials once you set this default to "allow".
+    "delete_path": {
+      "default": "confirm",
+      "always_confirm": [
+        { "scope": "outside" },
+        { "pattern": "(^|/)\\.(ssh|aws|gnupg|kube|azure)(/|$)" },
+        { "pattern": "(^|/)\\.config/(gcloud|gh)(/|$)" },
+        { "pattern": "(^|/)(\\.netrc|\\.git-credentials|\\.npmrc|\\.pypirc)$" },
+        { "pattern": "(^|/)\\.docker/config\\.json$" },
+        { "pattern": "(^|/)\\.env(?:\\.(local|dev|development|test|staging|prod|production))?$" },
+        { "pattern": "(^|/)(secrets?|credentials?)(/|$)" },
+        { "pattern": "\\.(pem|key|p12|pfx)$" }
+      ]
+    },
+    // A move is judged on both ends, which closes "rename it out of the way
+    // first" — a path a `delete_path` rule alone leaves open.
+    "move_path": {
+      "default": "allow",
+      "always_confirm": [
+        { "scope": "outside" },
+        { "pattern": "(^|/)\\.(ssh|aws|gnupg|kube|azure)(/|$)" },
+        { "pattern": "(^|/)\\.config/(gcloud|gh)(/|$)" },
+        { "pattern": "(^|/)(\\.netrc|\\.git-credentials|\\.npmrc|\\.pypirc)$" },
+        { "pattern": "(^|/)\\.docker/config\\.json$" },
+        { "pattern": "(^|/)\\.env(?:\\.(local|dev|development|test|staging|prod|production))?$" },
+        { "pattern": "(^|/)(secrets?|credentials?)(/|$)" },
+        { "pattern": "\\.(pem|key|p12|pfx)$" }
+      ]
+    },
+    // ---------------------------------------------------------------------
+    // Reads. The same credential patterns, and deliberately no
+    // `{ "scope": "outside" }` rule: reading outside the project is ordinary
+    // work, and a remote-scheme read (`ssh://host/etc/passwd`) already arrives
+    // as `outside`, so that rule would confirm routine reads.
+    // ---------------------------------------------------------------------
+    "read_file": {
+      "default": "allow",
+      "always_confirm": [
+        { "pattern": "(^|/)\\.(ssh|aws|gnupg|kube|azure)(/|$)" },
+        { "pattern": "(^|/)\\.config/(gcloud|gh)(/|$)" },
+        { "pattern": "(^|/)(\\.netrc|\\.git-credentials|\\.npmrc|\\.pypirc)$" },
+        { "pattern": "(^|/)\\.docker/config\\.json$" },
+        { "pattern": "(^|/)\\.env(?:\\.(local|dev|development|test|staging|prod|production))?$" },
+        { "pattern": "(^|/)(secrets?|credentials?)(/|$)" },
+        { "pattern": "\\.(pem|key|p12|pfx)$" }
+      ]
+    },
+    // ---------------------------------------------------------------------
+    // Arbitrary code with no matchable input, so only these defaults apply.
+    // `eval` runs in-process, `browser` runs it with a page attached, and
+    // `computer` drives the real keyboard, pointer and clipboard of the
+    // desktop — including every window that is not omp.
+    // ---------------------------------------------------------------------
+    "eval": {
+      "default": "confirm"
+    },
+    "browser": {
+      "default": "confirm"
+    },
+    "computer": {
+      "default": "deny"
+    },
+    // ---------------------------------------------------------------------
+    // Shell commands. Each pattern is matched against every sub-command
+    // separately (a pipeline is split), against each `> target` redirection,
+    // and — for a supervised launch — against `PWD=… NAME=value … program args`.
+    // A `^` therefore anchors one sub-command, not the whole command line.
+    // ---------------------------------------------------------------------
+    "terminal": {
+      "default": "allow",
+      "always_confirm": [
+        // Privilege and destruction.
+        { "pattern": "\\b(sudo|doas)\\b" },
+        { "pattern": "\\b(rm|rmdir|unlink|shred|truncate|dd|mkfs)\\b" },
+        { "pattern": "\\b(chmod|chown|chgrp)\\b" },
+        { "pattern": "\\b(kill|pkill|killall|shutdown|reboot)\\b" },
+
+        // History and working-tree rewrites.
+        { "pattern": "\\bgit\\b[^\\n]*\\b(push|reset|clean|restore|rebase)\\b" },
+        { "pattern": "\\bgit\\b[^\\n]*\\b(checkout|switch)\\b[^\\n]*(--force|--discard-changes|\\s-f(?:\\s|$)|\\s--\\s)" },
+        { "pattern": "\\bgit\\b[^\\n]*\\bbranch\\b[^\\n]*(\\s-D\\b|--force)" },
+        { "pattern": "\\bgit\\b[^\\n]*\\bstash\\s+(drop|clear)\\b" },
+
+        // Code that arrives from the network and then runs.
+        { "pattern": "\\b(npm|pnpm|yarn|bun)\\s+(install|add|remove|uninstall|update|upgrade|ci|publish)\\b" },
+        { "pattern": "\\b(npx|bunx)\\b|\\b(pnpm|yarn)\\s+dlx\\b" },
+
+        // Infrastructure that acts on something other than this machine.
+        { "pattern": "\\bterraform\\b[^\\n]*\\b(apply|destroy|import)\\b" },
+        { "pattern": "\\bkubectl\\b[^\\n]*\\b(apply|delete|replace|patch|scale|drain)\\b" },
+        { "pattern": "\\bdocker\\b[^\\n]*\\b(rm|rmi|prune|push)\\b" },
+
+        // Programs that open their own files, which no `write_file` rule can
+        // see: only a shell redirection is visible as a write target. The
+        // leading `NAME=value` group is there so an assignment prefix cannot
+        // step over the anchor.
+        { "pattern": "^(?:\\S+=\\S*\\s+)*(?:tee|cp|install)\\b" },
+        { "pattern": "\\bsed\\b[^\\n]*\\s-i" },
+        { "pattern": "\\b(?:python[0-9.]*|perl|ruby|node|bun|deno)\\b[^\\n]*\\s-(?:c|e)\\b" },
+
+        // Code loaded into an otherwise innocuous command through the
+        // environment. Matched unanchored, so `env LD_PRELOAD=… node -v` is
+        // caught as well as the bare assignment prefix.
+        { "pattern": "\\b(NODE_OPTIONS|BASH_ENV|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH|PYTHONSTARTUP|PERL5OPT|RUBYOPT|GIT_SSH_COMMAND)=" },
+
+        // Credential management: reading or rewriting where secrets live.
+        { "pattern": "\\bgit\\b[^\\n]*\\bconfig\\b[^\\n]*credential" },
+        { "pattern": "\\bgh\\s+(auth|secret|variable)\\b" },
+        { "pattern": "\\baws\\s+(configure|sts|iam|secretsmanager|ssm)\\b" },
+        { "pattern": "\\bgcloud\\s+auth\\b|\\baz\\s+(login|keyvault)\\b" },
+        { "pattern": "^(?:\\S+=\\S*\\s+)*security\\b" },
+        { "pattern": "^(?:\\S+=\\S*\\s+)*defaults\\s+(write|delete|import)\\b" },
+        { "pattern": "^(?:\\S+=\\S*\\s+)*(?:launchctl|crontab)\\b" },
+
+        // Exfiltration: a copy of this machine's files going somewhere else.
+        { "pattern": "^(?:\\S+=\\S*\\s+)*(?:scp|sftp|rsync)\\b" },
+        { "pattern": "^(?:\\S+=\\S*\\s+)*(?:nc|ncat|netcat|socat)\\b" },
+        { "pattern": "\\b(curl|wget)\\b[^\\n]*(\\s-T\\b|--upload-file\\b)" },
+        { "pattern": "\\bcurl\\b[^\\n]*(\\s-F\\b|--form\\b|(--data(-binary|-raw|-urlencode)?|\\s-d)\\s+@)" },
+
+        // A sub-command that is nothing but an interpreter reads its program
+        // from stdin, which is the `curl … | sh` shape.
+        { "pattern": "^(?:ba|z|k|da)?sh(\\s+-s?)?\\s*$" },
+        { "pattern": "^(python[0-9.]*|perl|ruby|node|bun)(\\s+-)?\\s*$" }
+      ]
+    }
+  }
+}
