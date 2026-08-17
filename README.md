@@ -124,6 +124,12 @@ The permissions block by itself:
 }
 ```
 
+### A baseline to start from
+
+[`samples/tool-permissions.json`](samples/tool-permissions.json) is a complete policy that goes further than the Quick start: it confirms writes and reads over credential paths, writes outside `project_root`, `eval` and `browser`, the shell programs that open files themselves, environment-variable injection, and credential-management and exfiltration commands. Copy it to `~/.omp/agent/tool-permissions.json` and it works unedited.
+
+It is a starting point to trim, not a guarantee. Its header states the posture, which rules to delete first when confirmations get noisy, and what it does not cover — search tools, MCP tools, and anything a program decides at run time rather than in the text of its arguments. Read the [Known limits](#known-limits) before relying on it. `test/samples.test.ts` holds the file to the decisions it advertises, so a weakened baseline fails the suite.
+
 ### Rule shape
 
 A complete configuration can set a global default, trusted projects, and rules for individual virtual tools:
@@ -302,6 +308,8 @@ omp's tool surface is wider than Zed's and has no `delete_path` tool. omp-toolga
 
 Both `mcp__server__tool` and `mcp:server:tool` work as configuration keys.
 
+That table is the complete set of names a rule can ever gate. A `tools` key outside it — `create_directory` and `copy_path`, which exist only in the protected-path floor, or a name from a newer omp than the one installed — is reported once at session start as a key no call maps to. The rest of the configuration loads and applies normally: omp's tool surface grows, and a name that is not real yet is not an error.
+
 ### Launch specifications
 
 A launch is judged on its whole specification, not only its command line. The working directory and environment are part of the string seen by `terminal` rules because variables such as `NODE_OPTIONS`, `BASH_ENV`, `LD_PRELOAD`, and `DYLD_INSERT_LIBRARIES` can load code into an otherwise innocuous command.
@@ -435,6 +443,8 @@ Anything other than an offered choice counts as denial, including canceling or c
 
 A session without an interactive UI, including `omp -p`, a subagent, or another print-mode run, cannot approve a `confirm` decision. The call is blocked and the reason says approval must happen in the parent interactive session. Confirmation never becomes an implicit allow.
 
+A blocked call's reason names the configuration file that decision actually came from: the project file for a project rule, the global file for a global rule, both loaded files when only a `default` applied, and the file holding a pattern that failed to compile. The decision floors configuration cannot disable — a symlink escape, a write to omp-toolgate's own configuration, an unexpanded target, an unreadable command — name no file, and say so, because editing one would not lift them.
+
 If the gate itself fails while evaluating a call, it blocks that call and reports the failure instead of silently opening the gate.
 
 ## Migrating from Zed
@@ -467,7 +477,7 @@ Compatibility is one-way. Zed does not understand omp-toolgate's `scope` or `tru
 
 - **ReDoS is bounded, not prevented.** Untrusted project patterns are capped in count and length, but Node's `RegExp` has no timeout. A catastrophic-backtracking pattern from a repository can still stall a decision. Use `trustedProjects` only for repositories you trust.
 
-- **Write-back reformats the file.** Recording an “always allow” rule serializes the complete document as JSON, removing comments and hand formatting. Keep handwritten notes in a file that is not written back, or restore them afterward. Do not symlink `~/.omp/agent/tool-permissions.json` to your Zed `settings.json`: the first global write-back would rewrite the Zed file as plain JSON.
+- **Write-back reformats the file.** Recording an “always allow” rule serializes the complete document as JSON, removing comments and hand formatting. Keep handwritten notes in a file that is not written back, or restore them afterward. This bites hardest on a copy of [`samples/tool-permissions.json`](samples/tool-permissions.json): every explanatory comment in it is gone after the first “always allow (global)”, so keep the pristine copy or choose “this project” instead, which writes the project file. Do not symlink `~/.omp/agent/tool-permissions.json` to your Zed `settings.json`: the first global write-back would rewrite the Zed file as plain JSON.
 
 - **Write-back is atomic but not locked.** Two sessions recording patterns in the same file at the same time can lose one pattern. The file is never left truncated, but it may be missing the older of two simultaneous additions.
 
