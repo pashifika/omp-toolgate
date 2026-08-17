@@ -185,11 +185,19 @@ export function loadPermissions(
   for (const [name, rules] of tools) {
     const invalid = rules.invalidPatterns;
     if (invalid.length === 0) continue;
+    // The pattern text and the engine's message about it both come from a file a
+    // repository ships, and this warning is read as the gate's own voice, so
+    // both are escaped for the same reason a tool key is.
     const detail = invalid
-      .map((entry) => `${entry.origin} "${entry.pattern}": ${entry.message}`)
+      .map(
+        (entry) =>
+          `${entry.origin} "${escapeControlCharacters(entry.pattern)}": ` +
+          escapeControlCharacters(entry.message),
+      )
       .join("; ");
     warnings.push(
-      `tool "${name}" has ${invalid.length} invalid pattern(s) and denies every call (${detail})`,
+      `tool "${escapeControlCharacters(name)}" has ${invalid.length} invalid pattern(s) ` +
+        `and denies every call (${detail})`,
     );
   }
 
@@ -354,8 +362,10 @@ function sanitizeBlock(
       sink.warnings.push(fileWarning(sink.file, '"tools" is not an object and was ignored'));
     } else {
       // A key is third-party text: it comes from a file a repository ships, and
-      // it ends up in a warning the user reads as the gate's own voice. Every
-      // label below is built from the escaped form for that reason.
+      // it ends up in a warning the user reads as the gate's own voice. It is
+      // escaped here rather than only in `fileWarning` because the clip below
+      // has to measure the escaped width, and because every nested label
+      // (`tools.<key>.always_deny[3]`) is built from it.
       const unmappable: string[] = [];
       for (const [key, value] of Object.entries(toolsValue)) {
         const name = canonicalizeToolName(key);
@@ -669,7 +679,7 @@ function discardProjectList(
   sink.warnings.push(
     fileWarning(
       sink.file,
-      `discarded ${discarded.length} "${list}" rule(s) for "${name}": an untrusted project may ` +
+      `discarded ${discarded.length} "${list}" rule(s) for "${escapeControlCharacters(name)}": an untrusted project may ` +
         `only tighten the global rules, and ${reason}`,
     ),
   );
@@ -706,7 +716,7 @@ function applyProjectLimits(
       warnings.push(
         fileWarning(
           file,
-          `dropped ${dropped} rule(s) for "${name}": an untrusted project may contribute at most ` +
+          `dropped ${dropped} rule(s) for "${escapeControlCharacters(name)}": an untrusted project may contribute at most ` +
             `${PROJECT_PATTERN_LIMIT} rules per tool and ${PROJECT_PATTERN_LENGTH_LIMIT} characters per pattern`,
         ),
       );
@@ -856,8 +866,13 @@ function strictest(a: ToolPermissionMode, b: ToolPermissionMode): ToolPermission
 // Small shared helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * One warning about one file. Both halves are escaped here rather than at each
+ * of the twenty call sites: the path derives from `project_root`, and a detail
+ * may quote a pattern, a key, or a parser's message about the file's own bytes.
+ */
 function fileWarning(file: string, detail: string): string {
-  return `${file}: ${detail}`;
+  return `${escapeControlCharacters(file)}: ${escapeControlCharacters(detail)}`;
 }
 
 function isMode(value: unknown): value is ToolPermissionMode {

@@ -239,22 +239,70 @@ describe("the sample produces the decisions it advertises", () => {
   });
 
   /**
-   * The other half of the same fixes: each of these is a command a developer
-   * runs constantly, and each one sits one character away from a rule above.
-   * `curl -fsSL` is why the two curl rules are the only case-sensitive rules in
-   * the file — `-f` is not `-F`.
+   * The other half of every rule: a confirmation on an ordinary command is how a
+   * gate gets switched off, so each rule that was broadened to close a bypass
+   * carries the everyday commands that sit one character away from it. Four of
+   * these were measured confirming after the first fix round — a `git` command
+   * merely mentioning "credential", and `wget --method=GET` — and are the reason
+   * the credential rules require `git credential` or a literal `credential.`,
+   * and the wget rule names only body-carrying flags.
    */
   it.each([
+    // git, the most-run program in any session.
+    { what: "a status", command: "git status --short" },
+    { what: "a commit message that mentions credentials", command: "git commit -m 'add the credential docs'" },
+    { what: "a log search for the word credential", command: "git log --grep credential" },
+    { what: "showing a file named credentials.ts", command: "git show HEAD:src/credentials.ts" },
+    { what: "reading one config value", command: "git config --get user.email" },
+    { what: "a branch checkout", command: "git checkout -b feature/x" },
+    { what: "a branch switch", command: "git switch main" },
+    { what: "a branch listing", command: "git branch -a" },
+    { what: "a stash listing", command: "git stash list" },
+
+    // Network reads, which the header promises stay open.
     { what: "a silent curl fetch", command: "curl -fsSL https://example.com/x.json -o x.json" },
+    { what: "a curl with a header", command: "curl -H 'Accept: application/json' https://example.com" },
     { what: "a wget with a timeout", command: "wget -T 30 https://example.com/x.json" },
+    { what: "a wget that names its method", command: "wget --method=GET https://example.com" },
+
+    // Interpreters and shells running real files.
     { what: "sh with a command operand", command: "sh -c 'echo hi'" },
+    { what: "sh running a script", command: "sh scripts/setup.sh" },
     { what: "node with a script operand", command: "node build.js" },
+    { what: "node with a flag and a script", command: "node --experimental-strip-types run.ts" },
+    { what: "python running a script", command: "python3 manage.py migrate" },
+    { what: "node --version", command: "node --version" },
+    { what: "python --version", command: "python3 --version" },
+    { what: "ruby --help", command: "ruby --help" },
+    { what: "bash --version", command: "bash --version" },
+    { what: "node -v", command: "node -v" },
+
+    // Package managers doing something other than installing.
     { what: "npm test", command: "npm test" },
     { what: "npm run build", command: "npm run build" },
-    { what: "a branch checkout", command: "git checkout -b feature/x" },
-    { what: "a branch listing", command: "git branch" },
+    { what: "a test filter that happens to be i", command: "npm run test -- --grep i" },
+    { what: "bun run dev", command: "bun run dev" },
+    { what: "a dependency query", command: "npm ls --depth 0" },
+
+    // Wrapper words the anchored rules step over.
+    { what: "time in front of a test run", command: "time npm test" },
+    { what: "command -v", command: "command -v node" },
+    { what: "xargs in front of a counter", command: "xargs -0 wc -l < list" },
+
+    // A script whose path merely contains a gated program name.
+    { what: "a build script under src/cpp", command: "src/cpp/build.sh" },
+    { what: "a binary under node_modules", command: "node_modules/.bin/tsc --noEmit" },
+
+    // Read-only cluster and container work.
     { what: "kubectl get", command: "kubectl get pods" },
+    { what: "kubectl logs", command: "kubectl logs pod x" },
+    { what: "docker ps", command: "docker ps -a" },
+    { what: "docker build", command: "docker build -t x ." },
+
+    // Everyday text tools.
     { what: "sed without an in-place flag", command: "sed s/a/b/ src/a.ts" },
+    { what: "sed printing a range", command: "sed -n 1,20p src/a.ts" },
+    { what: "awk", command: "awk '{print $1}' log.txt" },
   ])("still allows $what", ({ command }) => {
     expect(published.decide("bash", { command })).toBe("allow");
   });
@@ -263,29 +311,32 @@ describe("the sample produces the decisions it advertises", () => {
 describe("the sample decides in bounded time", () => {
   /**
    * The gate sits in front of every tool call, so a decision that stalls is a
-   * stalled session — and two rules in this file have already been caught
-   * stalling. The first was an assignment-prefix group written `\S+=\S*`, which
-   * can split one word at any of its `=`: eighteen such words cost 11.3 s under
-   * Bun and 112 s under Node. The second was a rule carrying two greedy
-   * `[^\n]*` scans, whose cost grew cubically: 18 KB of `git checkout x ` cost
-   * 12.6 s.
+   * stalled session — and three rule shapes in this file have already been
+   * caught stalling:
    *
-   * Neither was caught by a check that timed one hand-written command, so this
-   * one derives its input from each pattern's own literal words. A rule that
-   * names `git` and `checkout` gets an input built from `git checkout`, which is
-   * the shape that makes that rule work hardest.
+   * - `\S+=\S*` as an assignment prefix, which can split one word at any of its
+   *   `=`: eighteen such words cost 11.3 s under Bun and 112 s under Node.
+   * - Two greedy `[^\n]*` scans in one pattern, whose cost grows cubically:
+   *   18 KB of `git checkout x ` cost 12.6 s.
+   * - One greedy `[^\n]*` scan, which restarts at every occurrence of the term
+   *   before it and so costs the square of the length: 120 KB cost 4.9 s across
+   *   the rule set.
    *
-   * The surviving rules are quadratic, not linear: `\bX\b[^\n]*Y` rescans to the
-   * end of the input for every occurrence of `X`. That is measured and accepted
-   * — 8 KB costs about 20 ms for the worst of them — because making it linear
-   * would mean anchoring the pattern, which silently narrows a multi-line
-   * command to its first line. The budget below is 25 times the worst measured
-   * cost and a fifth of what the cubic rule cost at the same size, so a slow
-   * machine cannot make it flake while a returning stall cannot pass.
+   * All three are gone. Every rule that means "this sub-command mentions A and
+   * mentions B" is now a pair of anchored lookaheads, which is one linear pass
+   * per term: 480 KB now costs 48 ms.
+   *
+   * None of the three was caught by a check that timed one hand-written command,
+   * so this one derives its input from each pattern's own literal words — a rule
+   * naming `git` and `checkout` gets an input built from `git checkout`, which is
+   * the shape that makes that rule work hardest — and it uses an input large
+   * enough to separate linear from quadratic. At 64 KB the whole rule set is
+   * about 5 ms while a single quadratic rule is several hundred, so the budget
+   * below cannot be met by a rule that regresses and cannot be missed by a slow
+   * machine.
    */
-  const INPUT_BYTES = 8_192;
-  const BUDGET_MS = 500;
-
+  const INPUT_BYTES = 65_536;
+  const BUDGET_MS = 250;
   /**
    * The literal words a pattern names, which are what an input has to repeat to
    * drive that pattern's scans. Regex syntax and one- or two-letter fragments of
