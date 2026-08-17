@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { canonicalizeToolName } from "./mapping.ts";
-import { MODE_STRICTNESS } from "./types.ts";
+import { isRecord, MODE_STRICTNESS } from "./types.ts";
 import type {
   CompiledRule,
   InvalidPattern,
@@ -691,15 +691,6 @@ function strictest(a: ToolPermissionMode, b: ToolPermissionMode): ToolPermission
 
 function fileWarning(file: string, detail: string): string {
   return `${file}: ${detail}`;
-}
-
-/**
- * The one boundary guard for this package: configuration files are untrusted
- * JSONC and no schema validator is available, so every field is checked where
- * it is read and only the "is it an object at all" question lives here.
- */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isMode(value: unknown): value is ToolPermissionMode {

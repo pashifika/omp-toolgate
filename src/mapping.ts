@@ -18,6 +18,7 @@
  * injected `PathResolver`.
  */
 
+import { isRecord } from "./types.ts";
 import type {
   DecisionInput,
   MappedCall,
@@ -206,7 +207,7 @@ export function mapToolCall(
   // `Object.prototype` members must not resolve to a mapper.
   const mapper = Object.hasOwn(MAPPERS, key) ? MAPPERS[key] : undefined;
   if (mapper === undefined) return NOT_MAPPED;
-  return mapper(asRecord(input) ?? EMPTY_ARGS, resolve);
+  return mapper(isRecord(input) ? input : EMPTY_ARGS, resolve);
 }
 
 /**
@@ -508,11 +509,10 @@ function mapTask(args: Readonly<Record<string, unknown>>): MappingResult {
 
   const inputs: DecisionInput[] = [];
   for (const entry of entries) {
-    const item = asRecord(entry);
-    if (item === undefined) continue;
-    const text = stringArg(item, "task");
+    if (!isRecord(entry)) continue;
+    const text = stringArg(entry, "task");
     if (text === undefined) continue;
-    const agent = stringArg(item, "agent") ?? DEFAULT_AGENT_TYPE;
+    const agent = stringArg(entry, "agent") ?? DEFAULT_AGENT_TYPE;
     inputs.push({ value: `${agent} ${text}` });
   }
   return oneCall("spawn_agent", inputs);
@@ -585,11 +585,6 @@ function toPathInput(normalized: NormalizedPath): DecisionInput {
     literal: normalized.literal,
     resolved: normalized.resolved,
   };
-}
-
-function asRecord(value: unknown): Readonly<Record<string, unknown>> | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
 }
 
 function stringArg(
