@@ -200,10 +200,10 @@
         // A `^`-anchored lookahead runs once and is atomic, so each of these is
         // one linear pass per term. `[\s\S]` rather than `[^\n]` so a multi-line
         // command is not silently reduced to its first line.
-        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*\\b(push|reset|clean|restore|rebase)\\b)" },
-        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*\\b(checkout|switch)\\b)(?=[\\s\\S]*(--force|--discard-changes|\\s-f(\\s|$)|\\s--\\s))" },
-        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*\\bbranch\\b)(?=[\\s\\S]*(\\s-D\\b|\\s-f\\b|\\s-M\\b|--force))" },
-        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*\\bstash\\s+(drop|clear)\\b)" },
+        { "pattern": "^(?=[\\s\\S]*(^|[\\s/])git(\\s|$))(?=[\\s\\S]*\\b(push|reset|clean|restore|rebase)\\b)" },
+        { "pattern": "^(?=[\\s\\S]*(^|[\\s/])git(\\s|$))(?=[\\s\\S]*\\b(checkout|switch)\\b)(?=[\\s\\S]*(--force|--discard-changes|\\s-f(\\s|$)|\\s--\\s))" },
+        { "pattern": "^(?=[\\s\\S]*(^|[\\s/])git(\\s|$))(?=[\\s\\S]*\\bbranch\\b)(?=[\\s\\S]*(\\s-D\\b|\\s-f\\b|\\s-M\\b|--force))" },
+        { "pattern": "^(?=[\\s\\S]*(^|[\\s/])git(\\s|$))(?=[\\s\\S]*\\bstash\\s+(drop|clear)\\b)" },
 
         // Code that arrives from the network and then runs. Two rules, because
         // the action can be an abbreviation right after the program (`npm i`)
@@ -247,8 +247,8 @@
         // The subcommand form prints a stored secret; the config form is always
         // spelled `credential.<something>`, and requiring the dot is what keeps
         // the word out of it.
-        { "pattern": "\\bgit\\s+credential\\b" },
-        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*credential\\.)" },
+        { "pattern": "^(?=[\\s\\S]*(^|[\\s/])git(\\s|$))(?=[\\s\\S]*\\bcredential\\s+(fill|approve|reject)\\b)" },
+        { "pattern": "^(?=[\\s\\S]*(^|[\\s/])git(\\s|$))(?=[\\s\\S]*credential\\.)" },
         { "pattern": "\\bgh\\s+(auth|secret|variable)\\b" },
         { "pattern": "\\baws\\s+(configure|sts|iam|secretsmanager|ssm)\\b" },
         { "pattern": "\\bgcloud\\s+auth\\b|\\baz\\s+(login|keyvault)\\b" },
@@ -274,7 +274,7 @@
         // own is not one either, so wget is matched on body-carrying flags only.
         { "pattern": "^(?=[\\s\\S]*\\bcurl\\b)(?=[\\s\\S]*(\\s-T|--upload-file))", "case_sensitive": true },
         { "pattern": "^(?=[\\s\\S]*\\bcurl\\b)(?=[\\s\\S]*(\\s-F|--form|(--data(-binary|-raw|-urlencode)?|\\s-d)[=\\s]*@))", "case_sensitive": true },
-        { "pattern": "^(?=[\\s\\S]*\\bwget\\b)(?=[\\s\\S]*(--post-file|--body-file|--body-data))" },
+        { "pattern": "^(?=[\\s\\S]*\\bwget\\b)(?=[\\s\\S]*(--post-file|--body-file|--body-data|--method=(PUT|POST|PATCH|DELETE)))" },
 
         // A sub-command that is nothing but an interpreter and its flags reads
         // its program from stdin, which is the `curl … | sh` shape. Flags are
