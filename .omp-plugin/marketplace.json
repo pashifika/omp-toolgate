@@ -1,0 +1,26 @@
+{
+  "name": "omp-toolgate",
+  "owner": {
+    "name": "pashifika"
+  },
+  "metadata": {
+    "description": "Regex-based tool permission gate for omp"
+  },
+  "plugins": [
+    {
+      "name": "omp-toolgate",
+      "description": "Per-tool regex rules over tool arguments, a project_root boundary, and symlink-escape detection. Ports Zed's agent.tool_permissions semantics to omp.",
+      "version": "1.0.0",
+      "source": {
+        "source": "github",
+        "repo": "pashifika/omp-toolgate",
+        "ref": "chore/v1.0.0-release-prep"
+      },
+      "category": "security",
+      "homepage": "https://github.com/pashifika/omp-toolgate",
+      "repository": "https://github.com/pashifika/omp-toolgate",
+      "license": "MIT",
+      "tags": ["security", "permissions", "approval", "gate"]
+    }
+  ]
+}
