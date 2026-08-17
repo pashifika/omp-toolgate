@@ -52,6 +52,58 @@ jobs:
       - run: bun install
       - run: bun run --bun test
 
+  # Proves the install command the README documents actually resolves on a clean
+  # machine, and that the installed tree exposes a loadable extension entry —
+  # the same thing omp's plugin installer validates before enabling a plugin.
+  #
+  # Not a pull-request job: it installs by ref, and a pull request's merge ref
+  # does not exist on the remote as an installable ref. It therefore runs on
+  # manual dispatch (any branch) and on pushes, which includes the tag push that
+  # publishes a release — so the documented command is verified against the
+  # exact ref users will type. It is deliberately absent from `ci`'s needs: a
+  # skipped job would otherwise fail the required check on every pull request.
+  install-check:
+    name: install check
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - name: Install the documented git spec into a scratch project
+        env:
+          SPEC: github:${{ github.repository }}#${{ github.ref_name }}
+        run: |
+          set -eu
+          work="$(mktemp -d)"
+          cd "$work"
+          printf '{"name":"install-check","private":true}\n' > package.json
+          echo "installing $SPEC"
+          bun add "$SPEC"
+          cat > check.ts <<'TS'
+          import { readFileSync } from "node:fs";
+
+          const manifestPath = "node_modules/omp-toolgate/package.json";
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+          const entries: string[] = manifest.omp?.extensions ?? [];
+          if (entries.length === 0) {
+            throw new Error("installed manifest declares no omp.extensions");
+          }
+          for (const entry of entries) {
+            const resolved = new URL(
+              `node_modules/omp-toolgate/${entry.replace(/^\.\//, "")}`,
+              `file://${process.cwd()}/`,
+            );
+            const module = await import(resolved.href);
+            if (typeof module.default !== "function") {
+              throw new Error(`${entry} does not default-export an extension factory`);
+            }
+            console.log(`ok ${entry} -> ${module.default.name}`);
+          }
+          console.log(`installed omp-toolgate ${manifest.version} with license ${manifest.license}`);
+          TS
+          bun check.ts
+
   # The single check name branch protection requires. Runtime jobs are never
   # named there, so changing the matrix never means editing the ruleset.
   ci:
