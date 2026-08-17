@@ -26,7 +26,10 @@
 //      every call. This is the last one to go: confirming a write to a private
 //      key while allowing a read of it protects nothing.
 // The `{ "scope": "outside" }` rules are the boundary omp itself does not have.
-// Delete them only if you routinely write outside the repository you are in.
+// Delete them only if you routinely write outside the repository you are in. The
+// case that surprises people is a shell redirection: `npm test > /tmp/out.log`
+// confirms, because the redirect target is judged as a `write_file` and /tmp is
+// outside the project. `> /dev/null` never is.
 //
 // SEARCH IS NOT GATED. `grep` and `find_path` carry no rules here, and a search
 // is a real read channel: grep output contains the matching lines. Confirming

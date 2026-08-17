@@ -517,7 +517,7 @@ npm test        # vitest run
 npm run typecheck   # tsc --noEmit
 ```
 
-The suite contains 622 tests across seven Vitest files, plus `tsc --noEmit` type checking. There is no build; tests execute the same TypeScript sources that omp loads. `test/samples.test.ts` loads `samples/tool-permissions.json` through the real loader, so the published baseline fails the suite if it stops producing the decisions it advertises.
+The suite contains 626 tests across seven Vitest files, plus `tsc --noEmit` type checking. There is no build; tests execute the same TypeScript sources that omp loads. `test/samples.test.ts` loads `samples/tool-permissions.json` through the real loader, so the published baseline fails the suite if it stops producing the decisions it advertises.
 
 `src/index.ts` default-exports the `ompToolgate(pi)` factory and registers the extension. The remaining modules each own one part of the gate:
 
