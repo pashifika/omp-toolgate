@@ -189,6 +189,34 @@ describe("the sample produces the decisions it advertises", () => {
   });
 });
 
+describe("the sample decides in bounded time", () => {
+  /**
+   * Six of the sample's `terminal` rules are anchored behind a
+   * `NAME=value` prefix group. Written as `\S+=\S*`, that group can split a
+   * single word at any of its `=`, and the split points multiply across words:
+   * eighteen leading words took 11.3 seconds to decide before the group was
+   * narrowed to `[^\s=]+=`, which admits exactly one split per word.
+   *
+   * The gate sits in front of every tool call, so a decision that stalls is a
+   * stalled session. The budget is deliberately loose — three orders of
+   * magnitude above the measured cost, two below the regression — so a slow
+   * machine cannot make this flake.
+   */
+  const BUDGET_MS = 1_000;
+
+  it("does not backtrack on a command built from assignment-shaped words", () => {
+    const words = Array.from({ length: 18 }, (_unused, index) => `v${index}=a=b=c`).join(" ");
+    const command = `${words} echo hi`;
+
+    const started = performance.now();
+    const mode = published.decide("bash", { command });
+    const elapsed = performance.now() - started;
+
+    expect(mode).toBe("allow");
+    expect(elapsed).toBeLessThan(BUDGET_MS);
+  });
+});
+
 describe("the check bites when the baseline is weakened", () => {
   /**
    * Deleting the `.env` rule from every list it appears in is the smallest
