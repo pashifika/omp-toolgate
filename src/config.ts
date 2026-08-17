@@ -18,7 +18,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
-import { canonicalizeToolName } from "./mapping.ts";
+import { canonicalizeToolName, isMappableVirtualTool } from "./mapping.ts";
 import { canonicalizePath } from "./project-root.ts";
 import { isRecord, MODE_STRICTNESS } from "./types.ts";
 import type {
@@ -331,7 +331,17 @@ function sanitizeBlock(
       sink.warnings.push(fileWarning(sink.file, '"tools" is not an object and was ignored'));
     } else {
       for (const [key, value] of Object.entries(toolsValue)) {
-        sanitizeToolEntry(tools, canonicalizeToolName(key), key, value, sink);
+        const name = canonicalizeToolName(key);
+        // A rule under a name no call can be classified as looks protective and
+        // gates nothing, so it is reported rather than accepted in silence. It
+        // is not an error: omp's tool surface grows, and a name that becomes
+        // real later must not cost the user the rest of their configuration.
+        if (!isMappableVirtualTool(name)) {
+          sink.warnings.push(
+            fileWarning(sink.file, `"tools.${key}" has no effect: no omp call maps to "${name}"`),
+          );
+        }
+        sanitizeToolEntry(tools, name, key, value, sink);
       }
     }
   }
