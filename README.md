@@ -193,27 +193,57 @@ onto Zed's names by `(real tool, operation)`:
 | `grep`, `xd://ast_grep`                              | `grep`        | the pattern and each search root  |
 | `xd://ast_edit`                                      | `edit_file`   | each element of `paths`           |
 | `bash`                                               | `terminal`    | the command                       |
-| `hub` with `op: "start"`                             | `terminal`    | `application` + `args`            |
-| `xd://debug` `launch` / `attach`                     | `terminal`    | `program` + `args`                |
+| `hub` with `op: "start"`                             | `terminal`    | `PWD=<cwd> NAME=value … application args` |
+| `hub` with `op: "send"`                              | `terminal`    | the `text` written to the process |
+| `xd://debug` `launch` / `attach`                     | `terminal`    | the same launch-spec shape        |
+| `xd://debug` `evaluate` / `custom_request`           | `terminal`    | the expression or command         |
+| `xd://debug` `write_memory`, breakpoint conditions   | `terminal`    | the condition; none for a raw write |
 | `task`                                               | `spawn_agent` | `agent` and task text             |
 | `web_search`                                         | `web_search`  | the query                         |
 | `manage_skill` create / update / delete              | `write_file` / `delete_path` | the skill's `SKILL.md` |
+| `learn` writing a skill                              | `write_file`  | the skill's `SKILL.md`            |
 | `memory_edit` forget                                 | `delete_path` | the memory id                     |
-| `eval`, `xd://browser`, `xd://lsp` edit actions      | `eval` / `browser` / `edit_file` | none — `default` only |
+| `write` to a writable scheme (`ssh://`, `vault://`, unknown) | `write_file` | the whole URI, scope `outside` |
+| `eval`, `xd://browser`, `computer`, `xd://lsp` edit actions | `eval` / `browser` / `computer` / `edit_file` | none — `default` only |
 | `mcp__<server>__<tool>`                              | `mcp:<server>:<tool>` | every string argument     |
 
 Both `mcp__server__tool` and `mcp:server:tool` work as configuration keys.
 
+A launch is judged on its whole spec, not just its command line: the working directory and
+the environment are part of the string the rules see, because `NODE_OPTIONS`, `BASH_ENV`,
+`LD_PRELOAD` and `DYLD_INSERT_LIBRARIES` load code into an otherwise innocuous command. If
+you run with a permissive `terminal.default`, add a rule for them:
+
+```jsonc
+{ "pattern": "\\b(NODE_OPTIONS|BASH_ENV|LD_PRELOAD|DYLD_INSERT_LIBRARIES|PYTHONSTARTUP)=" }
+```
+
 `terminal` commands are split into sub-commands first (`&&`, `||`, `;`, `|`, `|&`, a bare
 `&`, newlines, `$(...)`, backticks, subshells), and a redirection to a real file becomes its
-own checked entry, so `printf x > .env` cannot ride on an `always_allow` of `^printf`. If a
-command cannot be split with confidence, `always_allow` is not evaluated at all and the
-default applies.
+own checked entry — and additionally a `write_file` decision — so `printf x > .env` cannot
+ride on an `always_allow` of `^printf`, and `printf x >> ~/.ssh/authorized_keys` is caught by
+the same rule that governs a `write`. Two cases refuse to guess instead: a command whose
+**name** comes out of an expansion (`$x$y -rf ~`, `$(which rm)`) and a command the splitter
+cannot read at all are floored at `confirm`, because nothing there says which program runs.
+An expansion in an argument position (`echo ${HOME}`, `awk '{print $1}'`) is unaffected.
 
 Tools with no entry in the table — `todo`, `ask`, `checkpoint`, `xd://resolve`, … — pass
 through ungated. A tool that *is* in the table but was called with an argument shape this
 mapping does not understand gets a `default`-only decision, never an implicit allow, and
 warns once per session.
+
+**Set a strict `default` for the tools that carry no matchable input.** `eval`,
+`xd://browser`, `computer` and `xd://debug write_memory` are gated on their `default` alone,
+because an arbitrary code payload, a desktop action or a memory address is not text a regex
+can judge. With a global `default: allow` they are effectively open, so name them:
+
+```jsonc
+"tools": {
+  "eval": { "default": "confirm" },
+  "browser": { "default": "confirm" },
+  "computer": { "default": "deny" },
+}
+```
 
 ## Confirm prompts
 
@@ -305,6 +335,14 @@ carrying them is not meant to be moved back into Zed.
 
 ## Known limits
 
+- **A shell command can write where its rules cannot see.** `write_file` rules govern the
+  `write` and `edit` tools and a shell *redirection*, because a redirect target is visible in
+  the command string. They cannot govern a program that opens a file itself — `tee`,
+  `dd of=`, `cp`, `install`, `sed -i`, `python -c`. Gating those would mean modelling every
+  program's write semantics. This is why the recommended configuration confirms the
+  destructive commands by name in `terminal.always_confirm` rather than relying on path
+  rules to catch a shell, and why the gate's own configuration files get a floor that also
+  covers `terminal`.
 - **`xd://lsp` targets are unknown.** `rename`, `rename_file`, `code_actions` and a raw
   `request` can all carry a workspace edit whose files cannot be determined from the
   arguments, so they are gated on `edit_file.default` alone. `diagnostics` is deliberately
