@@ -475,7 +475,7 @@ Compatibility is one-way. Zed does not understand omp-toolgate's `scope` or `tru
 
 - **`--add-dir` roots count as outside.** Additional directories are reachable through `ctx.sessionManager.getAdditionalDirectories()`, but `scope` is intentionally defined only against `project_root`. Treating additional roots as inside would silently disable the `{ "scope": "outside" }` rule that compensates for omp's missing workspace boundary.
 
-- **ReDoS is bounded, not prevented.** Untrusted project patterns are capped in count and length, but Node's `RegExp` has no timeout. A catastrophic-backtracking pattern from a repository can still stall a decision. Use `trustedProjects` only for repositories you trust.
+- **ReDoS is bounded, not prevented.** Untrusted project patterns are capped in count and length, but neither Node's nor Bun's `RegExp` has a timeout. A catastrophic-backtracking pattern from a repository can still stall a decision. Use `trustedProjects` only for repositories you trust. The global file is not capped at all, so the same care applies to patterns you write by hand: prefer a character class over `\S` where a separator is what you mean, since `\S+=\S*` can split one shell word at any `=` while `[^\s=]+=\S*` cannot. `test/samples.test.ts` holds the published sample to a time budget for exactly this reason.
 
 - **Write-back reformats the file.** Recording an “always allow” rule serializes the complete document as JSON, removing comments and hand formatting. Keep handwritten notes in a file that is not written back, or restore them afterward. This bites hardest on a copy of [`samples/tool-permissions.json`](samples/tool-permissions.json): every explanatory comment in it is gone after the first “always allow (global)”, so keep the pristine copy or choose “this project” instead, which writes the project file. Do not symlink `~/.omp/agent/tool-permissions.json` to your Zed `settings.json`: the first global write-back would rewrite the Zed file as plain JSON.
 
@@ -517,7 +517,7 @@ npm test        # vitest run
 npm run typecheck   # tsc --noEmit
 ```
 
-The suite contains 626 tests across seven Vitest files, plus `tsc --noEmit` type checking. There is no build; tests execute the same TypeScript sources that omp loads. `test/samples.test.ts` loads `samples/tool-permissions.json` through the real loader, so the published baseline fails the suite if it stops producing the decisions it advertises.
+The suite is seven Vitest files of over 600 tests, plus `tsc --noEmit` type checking. There is no build; tests execute the same TypeScript sources that omp loads. `test/samples.test.ts` loads `samples/tool-permissions.json` through the real loader, so the published baseline fails the suite if it stops producing the decisions it advertises or if a rule in it starts costing more than a bounded amount of time to evaluate.
 
 `src/index.ts` default-exports the `ompToolgate(pi)` factory and registers the extension. The remaining modules each own one part of the gate:
 
