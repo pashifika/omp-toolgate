@@ -18,41 +18,47 @@ import { appendAlwaysAllow, buildBlockReason, planApproval } from "./prompt.ts";
 import { createPathResolver, resolveProjectRoot } from "./project-root.ts";
 import { isRecord, type PathResolver } from "./types.ts";
 
-interface UiContext {
+/**
+ * The slice of omp's host API this extension uses, described structurally so
+ * the repository type-checks without depending on the omp package. Exported so
+ * `test/index.test.ts` can implement the same contract instead of guessing it.
+ */
+export interface UiContext {
   select(title: string, options: string[]): Promise<unknown>;
   notify(message: string, level: string): void;
 }
 
-interface ExtensionContext {
+export interface ExtensionContext {
   readonly cwd: string;
   readonly hasUI: boolean;
   readonly ui: UiContext;
 }
 
-interface ToolCallEvent {
+export interface ToolCallEvent {
   readonly toolName: string;
   readonly input: unknown;
 }
 
 /** What a `tool_call` handler may return to stop the call. */
-interface ToolCallOutcome {
+export interface ToolCallOutcome {
   readonly block: true;
   readonly reason: string;
 }
 
-interface ExtensionApi {
+export type SessionStartHandler = (
+  event: unknown,
+  ctx: ExtensionContext,
+) => Promise<void>;
+
+export type ToolCallHandler = (
+  event: ToolCallEvent,
+  ctx: ExtensionContext,
+) => Promise<ToolCallOutcome | undefined>;
+
+export interface ExtensionApi {
   setLabel(label: string): void;
-  on(
-    event: "session_start",
-    handler: (event: unknown, ctx: ExtensionContext) => Promise<void>,
-  ): unknown;
-  on(
-    event: "tool_call",
-    handler: (
-      event: ToolCallEvent,
-      ctx: ExtensionContext,
-    ) => Promise<ToolCallOutcome | undefined>,
-  ): unknown;
+  on(event: "session_start", handler: SessionStartHandler): unknown;
+  on(event: "tool_call", handler: ToolCallHandler): unknown;
 }
 
 /** Bun ships a JSONC parser; Node does not, so tests fall back to `json5`. */
