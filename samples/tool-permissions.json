@@ -187,28 +187,36 @@
         { "pattern": "\\b(rm|rmdir|unlink|shred|truncate|dd|mkfs)\\b" },
         { "pattern": "\\b(chmod|chown|chgrp)\\b" },
         { "pattern": "\\b(kill|pkill|killall|shutdown|reboot)\\b" },
-
-        // History and working-tree rewrites. The lookahead is load-bearing: two
-        // greedy `[^\n]*` scans in one pattern multiply into cubic cost on a long
-        // command that matches neither, and a lookahead is atomic, so it scans
-        // once and keeps nothing to backtrack into.
-        { "pattern": "\\bgit\\b[^\\n]*\\b(push|reset|clean|restore|rebase)\\b" },
-        { "pattern": "\\bgit\\b(?=[^\\n]*\\b(checkout|switch)\\b)[^\\n]*(--force|--discard-changes|\\s-f(?:\\s|$)|\\s--\\s)" },
-        { "pattern": "\\bgit\\b(?=[^\\n]*\\bbranch\\b)[^\\n]*(\\s-D\\b|\\s-f\\b|\\s-M\\b|--force)" },
-        { "pattern": "\\bgit\\b[^\\n]*\\bstash\\s+(drop|clear)\\b" },
+        // History and working-tree rewrites.
+        //
+        // Every rule below that needs two things present in one sub-command is
+        // written as two anchored lookaheads and nothing else, because that is
+        // what the rule actually means: "this sub-command mentions A and
+        // mentions B", in any order. Written the obvious way — `\bA\b[^\n]*B` —
+        // the scan restarts at every occurrence of A, so cost grows with the
+        // square of the command length, and two such scans in one pattern grow
+        // with the cube. Both shapes were measured stalling this gate on a
+        // command a model can emit: 18 KB cost 12.6 s, 120 KB cost 4.9 s.
+        // A `^`-anchored lookahead runs once and is atomic, so each of these is
+        // one linear pass per term. `[\s\S]` rather than `[^\n]` so a multi-line
+        // command is not silently reduced to its first line.
+        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*\\b(push|reset|clean|restore|rebase)\\b)" },
+        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*\\b(checkout|switch)\\b)(?=[\\s\\S]*(--force|--discard-changes|\\s-f(\\s|$)|\\s--\\s))" },
+        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*\\bbranch\\b)(?=[\\s\\S]*(\\s-D\\b|\\s-f\\b|\\s-M\\b|--force))" },
+        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*\\bstash\\s+(drop|clear)\\b)" },
 
         // Code that arrives from the network and then runs. Two rules, because
         // the action can be an abbreviation right after the program (`npm i`)
         // or a long name after flags (`npm --prefix /tmp/p install`), and a
         // single pattern covering both would match a bare `i` anywhere.
         { "pattern": "\\b(npm|pnpm|yarn|bun)\\s+(i|in|ins|install|add|rm|un|uninstall|remove|up|update|upgrade|ci|exec|dlx|create|publish|link)\\b" },
-        { "pattern": "\\b(npm|pnpm|yarn|bun)\\b[^\\n]*\\s(install|add|uninstall|remove|update|upgrade|exec|publish)\\b" },
+        { "pattern": "^(?=[\\s\\S]*\\b(npm|pnpm|yarn|bun)\\b)(?=[\\s\\S]*\\s(install|add|uninstall|remove|update|upgrade|exec|publish)\\b)" },
         { "pattern": "\\b(npx|bunx)\\b|\\b(pnpm|yarn)\\s+dlx\\b" },
 
         // Infrastructure that acts on something other than this machine.
-        { "pattern": "\\bterraform\\b[^\\n]*\\b(apply|destroy|import)\\b" },
-        { "pattern": "\\bkubectl\\b[^\\n]*\\b(apply|delete|replace|patch|scale|drain|create|edit|set|rollout|exec|run|cp|annotate|label)\\b" },
-        { "pattern": "\\bdocker\\b[^\\n]*\\b(rm|rmi|prune|push)\\b" },
+        { "pattern": "^(?=[\\s\\S]*\\bterraform\\b)(?=[\\s\\S]*\\b(apply|destroy|import)\\b)" },
+        { "pattern": "^(?=[\\s\\S]*\\bkubectl\\b)(?=[\\s\\S]*\\b(apply|delete|replace|patch|scale|drain|create|edit|set|rollout|exec|run|cp|annotate|label)\\b)" },
+        { "pattern": "^(?=[\\s\\S]*\\bdocker\\b)(?=[\\s\\S]*\\b(rm|rmi|prune|push)\\b)" },
 
         // Programs that open their own files, which no `write_file` rule can
         // see: only a shell redirection is visible as a write target.
@@ -223,18 +231,24 @@
         // split one word at any of its `=`, which multiplies across words into
         // catastrophic backtracking on a command that matches nothing.
         { "pattern": "^(?:[^\\s=]+=\\S*\\s+|(env|nohup|nice|stdbuf|command|exec|time|xargs)\\s+)*(\\S*/)?(tee|cp|install)\\b" },
-        { "pattern": "\\bsed\\b[^\\n]*(\\s-i|--in-place)" },
-        { "pattern": "\\b(python[0-9.]*|perl|ruby|node|bun|deno)\\b[^\\n]*(\\s-(c|e|p)\\b|--eval\\b|--print\\b|--input-type\\b)" },
+        { "pattern": "^(?=[\\s\\S]*\\bsed\\b)(?=[\\s\\S]*(\\s-i|--in-place))" },
+        { "pattern": "^(?=[\\s\\S]*\\b(python[0-9.]*|perl|ruby|node|bun|deno)\\b)(?=[\\s\\S]*(\\s-(c|e|p)\\b|--eval\\b|--print\\b|--input-type\\b))" },
 
         // Code loaded into an otherwise innocuous command through the
         // environment. Matched unanchored, so `env LD_PRELOAD=… node -v` is
         // caught as well as the bare assignment prefix.
         { "pattern": "\\b(NODE_OPTIONS|BASH_ENV|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH|PYTHONSTARTUP|PERL5OPT|RUBYOPT|GIT_SSH_COMMAND)=" },
 
-        // Credential management: reading or rewriting where secrets live. One
-        // `credential` rule covers both `git config … credential.helper` and
-        // `git credential fill`, which prints a stored secret.
-        { "pattern": "\\bgit\\b[^\\n]*credential" },
+        // Credential management: reading or rewriting where secrets live.
+        //
+        // Two git rules rather than one `credential` scan, because that scan
+        // also fired on `git commit -m 'add the credential docs'`, on
+        // `git log --grep credential`, and on any path named `credentials.ts`.
+        // The subcommand form prints a stored secret; the config form is always
+        // spelled `credential.<something>`, and requiring the dot is what keeps
+        // the word out of it.
+        { "pattern": "\\bgit\\s+credential\\b" },
+        { "pattern": "^(?=[\\s\\S]*\\bgit\\b)(?=[\\s\\S]*credential\\.)" },
         { "pattern": "\\bgh\\s+(auth|secret|variable)\\b" },
         { "pattern": "\\baws\\s+(configure|sts|iam|secretsmanager|ssm)\\b" },
         { "pattern": "\\bgcloud\\s+auth\\b|\\baz\\s+(login|keyvault)\\b" },
@@ -256,18 +270,19 @@
         // `--upload-file=secret`, `-Ffile=@secret`) is caught too.
         //
         // wget is a separate rule because the same letter means something else
-        // there: `wget -T 30` is a timeout, not an upload, so wget is matched on
-        // its long upload flags only.
-        { "pattern": "\\bcurl\\b[^\\n]*(\\s-T|--upload-file)", "case_sensitive": true },
-        { "pattern": "\\bcurl\\b[^\\n]*(\\s-F|--form|(--data(-binary|-raw|-urlencode)?|\\s-d)[=\\s]*@)", "case_sensitive": true },
-        { "pattern": "\\bwget\\b[^\\n]*(--post-file|--body-file|--body-data|--method)" },
+        // there: `wget -T 30` is a timeout, not an upload, and `--method` on its
+        // own is not one either, so wget is matched on body-carrying flags only.
+        { "pattern": "^(?=[\\s\\S]*\\bcurl\\b)(?=[\\s\\S]*(\\s-T|--upload-file))", "case_sensitive": true },
+        { "pattern": "^(?=[\\s\\S]*\\bcurl\\b)(?=[\\s\\S]*(\\s-F|--form|(--data(-binary|-raw|-urlencode)?|\\s-d)[=\\s]*@))", "case_sensitive": true },
+        { "pattern": "^(?=[\\s\\S]*\\bwget\\b)(?=[\\s\\S]*(--post-file|--body-file|--body-data))" },
 
         // A sub-command that is nothing but an interpreter and its flags reads
         // its program from stdin, which is the `curl … | sh` shape. Flags are
         // allowed (`sh -e`, `bash -eux`, `node --input-type=module`) but an
-        // operand is not, so `sh -c 'echo hi'` stays out of this rule.
-        { "pattern": "^(ba|z|k|da)?sh(\\s+-{1,2}[A-Za-z][\\w-]*|\\s+-)*\\s*$" },
-        { "pattern": "^(python[0-9.]*|perl|ruby|node|bun)(\\s+-{1,2}[A-Za-z][\\w.=-]*|\\s+-)*\\s*$" }
+        // operand is not, so `sh -c 'echo hi'` stays out of this rule. The
+        // leading guard is for the flags that print and exit instead of reading
+        // anything: `node --version` and `ruby --help` are not this shape.
+        { "pattern": "^(?!.*(--version|--help|\\s-[hvV](\\s|$)))((ba|z|k|da)?sh|python[0-9.]*|perl|ruby|node|bun|deno)(\\s+-{1,2}[A-Za-z][\\w.=-]*|\\s+-)*\\s*$" }
       ]
     }
   }
