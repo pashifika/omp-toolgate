@@ -20,7 +20,7 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import { canonicalizeToolName, isMappableVirtualTool } from "./mapping.ts";
 import { canonicalizePath } from "./project-root.ts";
-import { isRecord, MODE_STRICTNESS } from "./types.ts";
+import { escapeControlCharacters, isRecord, MODE_STRICTNESS } from "./types.ts";
 import type {
   CompiledRule,
   InvalidPattern,
@@ -314,6 +314,29 @@ function looksLikeBlock(value: unknown): value is Record<string, unknown> {
   return isRecord(value) && BLOCK_MARKER_KEYS.some((key) => key in value);
 }
 
+/** Longest key text one warning quotes, so a padded key cannot fill the notification. */
+const MAX_QUOTED_KEY_LENGTH = 60;
+
+/**
+ * How many keys one warning names before it counts the rest. A repository can
+ * ship thousands of dead keys, and one notification per key would drown every
+ * other warning at session start; the count keeps the report honest anyway.
+ */
+const MAX_QUOTED_KEYS = 10;
+
+/** One warning for every key in one file that no omp call can be classified as. */
+function unmappableWarning(labels: readonly string[]): string {
+  const quoted = labels.slice(0, MAX_QUOTED_KEYS).map((label) => {
+    const clipped =
+      label.length <= MAX_QUOTED_KEY_LENGTH ? label : `${label.slice(0, MAX_QUOTED_KEY_LENGTH)}…`;
+    return `"tools.${clipped}"`;
+  });
+  const rest = labels.length - quoted.length;
+  const tail = rest > 0 ? ` (and ${rest} more)` : "";
+  const subject = labels.length === 1 ? "1 tool key has" : `${labels.length} tool keys have`;
+  return `${subject} no effect: no omp call maps to ${quoted.join(", ")}${tail}`;
+}
+
 function sanitizeBlock(
   block: Record<string, unknown>,
   origin: RuleOrigin,
@@ -330,18 +353,22 @@ function sanitizeBlock(
     if (!isRecord(toolsValue)) {
       sink.warnings.push(fileWarning(sink.file, '"tools" is not an object and was ignored'));
     } else {
+      // A key is third-party text: it comes from a file a repository ships, and
+      // it ends up in a warning the user reads as the gate's own voice. Every
+      // label below is built from the escaped form for that reason.
+      const unmappable: string[] = [];
       for (const [key, value] of Object.entries(toolsValue)) {
         const name = canonicalizeToolName(key);
+        const label = escapeControlCharacters(key);
         // A rule under a name no call can be classified as looks protective and
         // gates nothing, so it is reported rather than accepted in silence. It
         // is not an error: omp's tool surface grows, and a name that becomes
         // real later must not cost the user the rest of their configuration.
-        if (!isMappableVirtualTool(name)) {
-          sink.warnings.push(
-            fileWarning(sink.file, `"tools.${key}" has no effect: no omp call maps to "${name}"`),
-          );
-        }
-        sanitizeToolEntry(tools, name, key, value, sink);
+        if (!isMappableVirtualTool(name)) unmappable.push(label);
+        sanitizeToolEntry(tools, name, label, value, sink);
+      }
+      if (unmappable.length > 0) {
+        sink.warnings.push(fileWarning(sink.file, unmappableWarning(unmappable)));
       }
     }
   }

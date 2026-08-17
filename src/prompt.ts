@@ -10,7 +10,13 @@ import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "no
 import path from "node:path";
 import { digPermissionsContainer, type JsoncParser } from "./config.ts";
 import { canonicalizeToolName } from "./mapping.ts";
-import { isRecord, type Decision, type DecisionCause, type DecisionInput } from "./types.ts";
+import {
+  escapeControlCharacters,
+  isRecord,
+  type Decision,
+  type DecisionCause,
+  type DecisionInput,
+} from "./types.ts";
 
 /** Virtual tools whose decision inputs are paths, so path candidates apply. */
 const PATH_VIRTUAL_TOOLS: Readonly<Record<string, true>> = {
@@ -60,25 +66,13 @@ export interface ApprovalPaths {
  */
 const MAX_RENDERED_WIDTH = 200;
 
-/** Visible spellings for the control characters that would otherwise forge a line. */
-const CONTROL_ESCAPES: Readonly<Record<string, string>> = {
-  "\n": "\\n",
-  "\r": "\\r",
-  "\t": "\\t",
-};
-
 /**
- * Renders one model-supplied string for a line-oriented dialog. The body is
- * joined with `\n`, so a newline inside a tool argument — or inside a pattern
- * echoed from an untrusted project file — would add lines indistinguishable
- * from the gate's own. Every interpolation of untrusted text goes through here.
+ * Renders one model-supplied string for a line-oriented dialog: the shared
+ * control-character escape, plus a width bound that a configuration path
+ * deliberately does not get — a truncated path is not actionable.
  */
 function renderText(text: string): string {
-  const visible = text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu, (char) => {
-    const known = CONTROL_ESCAPES[char];
-    if (known !== undefined) return known;
-    return `\\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`;
-  });
+  const visible = escapeControlCharacters(text);
   if (visible.length <= MAX_RENDERED_WIDTH) return visible;
   return `${visible.slice(0, MAX_RENDERED_WIDTH)}… (truncated, ${visible.length} characters)`;
 }
@@ -337,7 +331,8 @@ export function planApproval(
     const origin = decision.cause.origin === "project" ? paths.projectPath : paths.globalPath;
     notes.push(
       `An always_confirm rule matched, and always_allow is evaluated after it, so no ` +
-        `recorded pattern can stop this prompt. To stop asking, edit the rule in ${origin}: ` +
+        `recorded pattern can stop this prompt. To stop asking, edit the rule in ` +
+        `${escapeControlCharacters(origin)}: ` +
         `${describeCondition(decision.cause)}.`,
     );
   } else {
@@ -376,7 +371,7 @@ export function planApproval(
       notes.push(
         paths.projectTrusted
           ? "The target is outside the project root, so it cannot be recorded in the project configuration."
-          : `This project is not listed in the global file's trustedProjects, so an always_allow rule in ${paths.projectPath} would be discarded on load. Record it globally instead, or add the project to trustedProjects.`,
+          : `This project is not listed in the global file's trustedProjects, so an always_allow rule in ${escapeControlCharacters(paths.projectPath)} would be discarded on load. Record it globally instead, or add the project to trustedProjects.`,
       );
     }
   }
@@ -453,7 +448,7 @@ export function buildBlockReason(
   const configuration =
     files.length === 0
       ? "No tool-permissions file can lift this decision."
-      : `Configuration: ${files.join(", ")}.`;
+      : `Configuration: ${files.map(escapeControlCharacters).join(", ")}.`;
   const tail =
     kind === "no-ui"
       ? " Approval must happen in the parent interactive session; do not retry here."

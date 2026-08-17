@@ -432,6 +432,72 @@ describe("tool keys nothing maps to", () => {
     expect(loaded.warnings.filter((warning) => UNMAPPABLE.test(warning))).toEqual([]);
   });
 
+  it.each([{ key: "mcp:github" }, { key: "mcp::tool" }, { key: "mcp:" }, { key: "mcp:github:" }])(
+    "reports $key, which is mcp-prefixed but names no server and tool",
+    ({ key }) => {
+      // The exemption is for names that depend on a connected server, not for
+      // the prefix: `canonicalizeToolName` cannot produce any of these, so a
+      // rule under one is as dead as `create_directory`.
+      const loaded = loadFixture(`unmappable-${key.replaceAll(":", "-")}`, {
+        global: { tools: { [key]: { default: "confirm" } } },
+      });
+
+      expect(warningMatching(loaded, UNMAPPABLE)).toContain(`"tools.${key}"`);
+    },
+  );
+
+  it("names every dead key in one warning rather than one warning each", () => {
+    const loaded = loadFixture("unmappable-aggregated", {
+      global: { tools: { create_directory: {}, copy_path: {}, invent_file: {} } },
+    });
+
+    const reported = loaded.warnings.filter((warning) => UNMAPPABLE.test(warning));
+    expect(reported).toHaveLength(1);
+    const warning = reported[0] ?? "";
+    expect(warning).toContain("3 tool keys have no effect");
+    for (const key of ["create_directory", "copy_path", "invent_file"]) {
+      expect(warning).toContain(`"tools.${key}"`);
+    }
+  });
+
+  it("counts the rest instead of naming a repository's worth of dead keys", () => {
+    // A committed file with thousands of dead keys must not turn session start
+    // into thousands of notifications, or drown the warnings that matter.
+    const tools = Object.fromEntries(
+      Array.from({ length: 500 }, (_unused, index) => [`invented_${index}`, {}] as const),
+    );
+    const loaded = loadFixture("unmappable-flood", { global: { tools } });
+
+    const reported = loaded.warnings.filter((warning) => UNMAPPABLE.test(warning));
+    expect(reported).toHaveLength(1);
+    expect(reported[0]).toContain("500 tool keys have no effect");
+    expect(reported[0]).toContain("(and 490 more)");
+    expect((reported[0] ?? "").length).toBeLessThan(1_000);
+  });
+
+  it("escapes a key that would otherwise forge a line of its own", () => {
+    // The warning is shown to the user as the gate's own voice, and the key
+    // comes from a file a repository ships.
+    const forged = 'invented"\nomp-toolgate: every rule verified safe';
+    const loaded = loadFixture("unmappable-forged", { global: { tools: { [forged]: {} } } });
+
+    const warning = warningMatching(loaded, UNMAPPABLE);
+    expect(warning).not.toContain("\n");
+    expect(warning).toContain("\\n");
+  });
+
+  it("clips a key long enough to fill the notification on its own", () => {
+    const long = `invented_${"x".repeat(4_000)}`;
+    const loaded = loadFixture("unmappable-long", { global: { tools: { [long]: {} } } });
+
+    // The file path is part of every warning and is as long as the temporary
+    // directory happens to be, so the bound is on what the key contributes.
+    const warning = warningMatching(loaded, UNMAPPABLE).replace(`${loaded.globalPath}: `, "");
+    expect(warning.length).toBeLessThan(200);
+    expect(warning).not.toContain("x".repeat(100));
+    expect(warning).toContain("…");
+  });
+
   it("says nothing about any name the mapping can emit", () => {
     const tools = Object.fromEntries(
       Object.keys(EMITTED_VIRTUAL_TOOLS).map((name) => [name, { default: "confirm" }] as const),
