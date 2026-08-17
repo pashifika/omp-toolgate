@@ -109,6 +109,13 @@ interface Emission extends MappedCall {
 }
 
 /**
+ * The `mcp:<server>:<tool>` shape {@link canonicalizeToolName} produces, with
+ * both segments non-empty. A server name containing a `:` still matches, since
+ * only the first separator is fixed.
+ */
+const MCP_KEY_SHAPE = /^mcp:[^:]+:.+$/;
+
+/**
  * Whether any omp call can be classified as `name` — either one of the emitted
  * names or an MCP tool, whose server and tool names are not knowable here.
  *
@@ -116,11 +123,22 @@ interface Emission extends MappedCall {
  * rule looks protective and gates nothing. `Object.hasOwn` because the name
  * comes from a configuration file, so an inherited `Object.prototype` member
  * must not read as an emitted tool.
+ *
+ * The MCP half is checked by shape rather than by prefix. A key of `mcp:github`
+ * or `mcp::tool` names no tool and no server, so no call can ever carry it, and
+ * treating the whole `mcp:` prefix as mappable would hide exactly the dead rule
+ * this function exists to surface.
  */
 export function isMappableVirtualTool(name: string): boolean {
-  return Object.hasOwn(EMITTED_VIRTUAL_TOOLS, name) || isMcpToolName(name);
+  return Object.hasOwn(EMITTED_VIRTUAL_TOOLS, name) || MCP_KEY_SHAPE.test(name);
 }
 
+/**
+ * Whether a real call's name is an MCP tool's. Deliberately looser than
+ * {@link MCP_KEY_SHAPE}: a call arriving under a malformed `mcp:` name is still
+ * an MCP tool's call, and routing it to the MCP mapping gates it on that name
+ * instead of dropping it through to the built-in table.
+ */
 function isMcpToolName(name: string): name is McpVirtualTool {
   return name.startsWith(MCP_ID_PREFIX);
 }

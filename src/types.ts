@@ -20,6 +20,35 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Visible spellings for the control characters that would otherwise forge a line. */
+const CONTROL_ESCAPES: Readonly<Record<string, string>> = {
+  "\n": "\\n",
+  "\r": "\\r",
+  "\t": "\\t",
+};
+
+/**
+ * Rewrites every character that could forge a line in text the gate emits.
+ *
+ * Both of the gate's outputs are line-oriented and both are read as the gate's
+ * own voice: the approval dialog by the user, and the block reason by the model.
+ * Every string that reaches either from outside — a tool argument, a pattern or
+ * a tool key from a committed project file, a path derived from the working
+ * directory — passes through here first, because a newline in any of them would
+ * add a line indistinguishable from one the gate wrote.
+ *
+ * Truncation is deliberately not part of this: a configuration path has to stay
+ * whole to be actionable, while a model-supplied argument does not. The caller
+ * decides.
+ */
+export function escapeControlCharacters(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu, (char) => {
+    const known = CONTROL_ESCAPES[char];
+    if (known !== undefined) return known;
+    return `\\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`;
+  });
+}
+
 /** Permission outcome. Ordered `allow` < `confirm` < `deny` by strictness. */
 export type ToolPermissionMode = "allow" | "confirm" | "deny";
 
@@ -217,9 +246,19 @@ export interface DecisionInput {
 /** Why a decision came out the way it did. */
 export interface DecisionCause {
   /**
-   * `default` when no rule matched, `escape` for symlink promotion, `protected`
-   * when the target is one of the gate's own configuration files, `unparseable`
-   * when a command's real text could not be determined.
+   * Why the decision came out the way it did:
+   *
+   * - `rule` — an `always_deny` / `always_confirm` / `always_allow` rule matched.
+   * - `default` — no rule matched, so a `default` applied.
+   * - `invalid-pattern` — a pattern for this tool failed to compile, which
+   *   denies every call to it.
+   * - `escape` — the target left the project root through a symlink.
+   * - `protected` — the target is one of the gate's own configuration files.
+   * - `unexpanded` — the target still holds an expansion the shell has not
+   *   performed, so where it lands is unknown.
+   * - `unparseable` — a command's real text could not be determined.
+   *
+   * The last four are floors that configuration cannot disable.
    */
   readonly kind:
     | "invalid-pattern"
