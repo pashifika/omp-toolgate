@@ -15,9 +15,12 @@
  * the difference is called out at the relevant branch below.
  *
  * This module never touches the filesystem: path normalization arrives as the
- * injected `PathResolver`.
+ * injected `PathResolver`. It does read `splitCommand` from the decision step,
+ * which is filesystem-free as well, to learn which files a shell command
+ * redirects into.
  */
 
+import { splitCommand } from "./decision.ts";
 import { isRecord } from "./types.ts";
 import type {
   DecisionInput,
@@ -160,11 +163,32 @@ const UNGATED_DEVICES: Readonly<Record<string, true>> = {
   report_issue: true,
 };
 
-/** `xd://lsp` actions that mutate files. The rest are read-only queries. */
+/**
+ * `xd://lsp` actions that can write files. `request` is here because a raw
+ * request may be `workspace/executeCommand`, whose `workspace/applyEdit`
+ * response the client applies to disk; which files that touches is no more
+ * knowable from the arguments than it is for `rename`.
+ *
+ * `diagnostics` is deliberately absent: the language server compiles the
+ * project whether or not this call is gated, so gating it would be theatre.
+ */
 const LSP_EDIT_ACTIONS: Readonly<Record<string, true>> = {
   rename: true,
   rename_file: true,
   code_actions: true,
+  request: true,
+};
+
+/**
+ * `xd://debug` actions that hand a string to a live process, and the argument
+ * carrying it. `evaluate` reaches the adapter's expression evaluator — lldb and
+ * gdb both expose `platform shell` there — and `custom_request` hands an
+ * arbitrary DAP request to the adapter. Every other action drives a session
+ * whose `launch` / `attach` was already gated.
+ */
+const DEBUG_COMMAND_ARGS: Readonly<Record<string, string>> = {
+  evaluate: "expression",
+  custom_request: "command",
 };
 
 /**
@@ -455,30 +479,88 @@ function mapMemoryEdit(args: Readonly<Record<string, unknown>>): MappingResult {
 
 // --- execution tools -------------------------------------------------------
 
-function mapBash(args: Readonly<Record<string, unknown>>): MappingResult {
+function mapBash(
+  args: Readonly<Record<string, unknown>>,
+  resolve: PathResolver,
+): MappingResult {
   const command = stringArg(args, "command");
   if (command === undefined) return missingArg("bash", "command", "terminal");
-  // Splitting a compound command into sub-commands belongs to the decision
-  // step, which needs Zed's ANY/ALL semantics to do it.
-  return oneCall("terminal", [{ value: command }]);
+  return commandCalls(command, resolve);
 }
 
-function mapHub(args: Readonly<Record<string, unknown>>): MappingResult {
-  // Messaging, job control and log reads start no process.
-  if (stringArg(args, "op") !== "start") return NOT_MAPPED;
-  const application = stringArg(args, "application");
-  if (application === undefined) return oneCall("terminal", EMPTY_INPUTS);
-  return oneCall("terminal", [{ value: joinCommand(application, args["args"]) }]);
+function mapHub(
+  args: Readonly<Record<string, unknown>>,
+  resolve: PathResolver,
+): MappingResult {
+  const op = stringArg(args, "op");
+  if (op === "start") {
+    const application = stringArg(args, "application");
+    if (application === undefined) return oneCall("terminal", EMPTY_INPUTS);
+    return commandCalls(joinCommand(application, args["args"]), resolve);
+  }
+  // `list`, `jobs`, `inbox`, `wait`, `ps`, `logs` and `describe` read state, and
+  // `cancel` / `stop` / `restart` only address a process whose launch line was
+  // already judged at `start`.
+  if (op !== "send") return NOT_MAPPED;
+
+  // A `send` carrying `text` writes stdin of a supervised process, so it is a
+  // command line for whatever runs there: gating `start` alone would leave
+  // `hub start /bin/sh` followed by arbitrary `text` completely open. `keys` and
+  // `signal` are input to that process too but carry no command text, so only
+  // the `terminal` default applies — as it does for a `text` of the wrong type,
+  // which is a payload this mapping cannot read rather than an absent one. A
+  // `send` with none of the three addresses a peer agent (`to` / `message`) and
+  // reaches no process.
+  const text = args["text"];
+  if (typeof text === "string") return commandCalls(text, resolve);
+  const reachesProcess =
+    text !== undefined || args["keys"] !== undefined || args["signal"] !== undefined;
+  return reachesProcess ? oneCall("terminal", EMPTY_INPUTS) : NOT_MAPPED;
 }
 
-function mapDebug(args: Readonly<Record<string, unknown>>): MappingResult {
+function mapDebug(
+  args: Readonly<Record<string, unknown>>,
+  resolve: PathResolver,
+): MappingResult {
   const action = stringArg(args, "action");
-  // Only `launch` and `attach` start or seize a process; the rest drive one
-  // that is already gated.
-  if (action !== "launch" && action !== "attach") return NOT_MAPPED;
-  const program = stringArg(args, "program");
-  if (program === undefined) return oneCall("terminal", EMPTY_INPUTS);
-  return oneCall("terminal", [{ value: joinCommand(program, args["args"]) }]);
+  if (action === undefined) return NOT_MAPPED;
+  if (action === "launch" || action === "attach") {
+    const program = stringArg(args, "program");
+    if (program === undefined) return oneCall("terminal", EMPTY_INPUTS);
+    return commandCalls(joinCommand(program, args["args"]), resolve);
+  }
+  // `Object.hasOwn` because the action is untrusted: an inherited
+  // `Object.prototype` member must not resolve to an argument name.
+  const key = Object.hasOwn(DEBUG_COMMAND_ARGS, action) ? DEBUG_COMMAND_ARGS[action] : undefined;
+  if (key === undefined) return NOT_MAPPED;
+  const command = stringArg(args, key);
+  return command === undefined
+    ? oneCall("terminal", EMPTY_INPUTS)
+    : commandCalls(command, resolve);
+}
+
+/**
+ * The calls one command string maps to: `terminal` judged on the whole string,
+ * plus — when the command redirects into real files — a `write_file` call
+ * carrying those targets, so that `write_file.always_deny` on `\.ssh/` governs
+ * `printf x >> ~/.ssh/authorized_keys` the way it governs a `write`. The
+ * decision step takes the strictest outcome across the calls, so a denied
+ * target denies the whole command.
+ *
+ * Splitting into sub-commands stays in the decision step, which needs Zed's
+ * ANY/ALL semantics for it; only the targets are needed here, and a command the
+ * splitter cannot read with confidence contributes none. A `>` that was never
+ * meant as a redirection (a comparison inside a `debug evaluate` expression)
+ * therefore costs an extra path check, which is the safe direction to err in.
+ */
+function commandCalls(command: string, resolve: PathResolver): MappingResult {
+  const terminal: MappedCall = { virtualTool: "terminal", inputs: [{ value: command }] };
+  const split = splitCommand(command);
+  if (split === undefined || split.redirects.length === 0) return { calls: [terminal] };
+
+  const targets: DecisionInput[] = [];
+  for (const target of split.redirects) targets.push(toPathInput(resolve(target)));
+  return { calls: [terminal, { virtualTool: "write_file", inputs: targets }] };
 }
 
 /** `application` / `program` plus argv, as the one string a rule would match. */
@@ -528,7 +610,9 @@ function mapLsp(args: Readonly<Record<string, unknown>>): MappingResult {
   if (action === undefined || LSP_EDIT_ACTIONS[action] !== true) return NOT_MAPPED;
   // Which files a `WorkspaceEdit` touches is not knowable here, so there are no
   // inputs and only `edit_file`'s `default` applies. `code_actions` is gated
-  // even when it only lists, because the table does not distinguish `apply`.
+  // even when it only lists, because the table does not distinguish `apply`, and
+  // `request` is gated whatever method it names, because the arguments are the
+  // server's business rather than this mapping's.
   return oneCall("edit_file", EMPTY_INPUTS);
 }
 

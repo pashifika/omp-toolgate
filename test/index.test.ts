@@ -57,6 +57,8 @@ interface HarnessOptions {
   answer?: (options: string[]) => unknown;
   /** Makes the dialog throw, to exercise the handler's own failure path. */
   selectThrows?: boolean;
+  /** Adds the sandbox project to the global file's `trustedProjects`. */
+  trustProject?: boolean;
 }
 
 function harness(options: HarnessOptions): Harness {
@@ -69,7 +71,13 @@ function harness(options: HarnessOptions): Harness {
 
   const globalFile = path.join(agentDir, "tool-permissions.json");
   const projectFile = path.join(repo, ".omp", "tool-permissions.json");
-  if (options.global !== undefined) writeFileSync(globalFile, options.global);
+  if (options.global !== undefined) {
+    const text =
+      options.trustProject === true
+        ? JSON.stringify({ ...JSON.parse(options.global), trustedProjects: [repo] })
+        : options.global;
+    writeFileSync(globalFile, text);
+  }
   if (options.project !== undefined) {
     mkdirSync(path.dirname(projectFile), { recursive: true });
     writeFileSync(projectFile, options.project);
@@ -269,20 +277,51 @@ describe("confirm with a UI", () => {
     expect(outcome?.reason).toContain("the user denied it");
   });
 
-  it("records the chosen pattern and stops asking for the rest of the session", async () => {
+  it("records only the approved path when the exact-path choice is taken", async () => {
     const host = harness({
       global: GUARDED,
       project: projectDefaultConfirm,
-      answer: (choices) => choices.find((choice) => choice.startsWith("Always allow (this project)")),
+      trustProject: true,
+      // The exact-path candidate is offered first, so it is the narrowest choice.
+      answer: (choices) => choices.find((choice) => choice.includes("covers only ")),
+    });
+
+    expect(
+      await host.toolCall(call("write", { path: "src/generated/a.ts", content: "x" }), host.ctx),
+    ).toBe(undefined);
+    expect(JSON.parse(readFileSync(host.projectFile, "utf8"))).toEqual({
+      tools: {
+        write_file: {
+          default: "confirm",
+          always_allow: [{ pattern: "^src/generated/a\\.ts$" }],
+        },
+      },
+    });
+
+    // A sibling file is not covered by the exact-path pattern, so it asks again.
+    expect(
+      await host.toolCall(call("write", { path: "src/generated/b.ts", content: "y" }), host.ctx),
+    ).toBe(undefined);
+    expect(host.prompts).toHaveLength(2);
+  });
+
+  it("records the directory pattern into a trusted project and stops asking", async () => {
+    const host = harness({
+      global: GUARDED,
+      project: projectDefaultConfirm,
+      trustProject: true,
+      answer: (choices) =>
+        choices.find(
+          (choice) =>
+            choice.startsWith("Always allow (this project)") && choice.includes("everything under it"),
+        ),
     });
 
     expect(
       await host.toolCall(call("write", { path: "src/generated/a.ts", content: "x" }), host.ctx),
     ).toBe(undefined);
     expect(host.prompts).toHaveLength(1);
-
-    const written: unknown = JSON.parse(readFileSync(host.projectFile, "utf8"));
-    expect(written).toEqual({
+    expect(JSON.parse(readFileSync(host.projectFile, "utf8"))).toEqual({
       tools: {
         write_file: {
           default: "confirm",
@@ -293,6 +332,38 @@ describe("confirm with a UI", () => {
     expect(host.notifications.join("\n")).toContain("recorded ^src/generated/");
 
     // The reload must make the recorded pattern effective immediately.
+    expect(
+      await host.toolCall(call("write", { path: "src/generated/b.ts", content: "y" }), host.ctx),
+    ).toBe(undefined);
+    expect(host.prompts).toHaveLength(1);
+  });
+
+  it("offers only the global target for an untrusted project, and it takes effect", async () => {
+    // An untrusted project's always_allow is discarded on load, so the project
+    // choice would be dead; the global one is what actually silences the prompt.
+    const host = harness({
+      global: GUARDED,
+      project: projectDefaultConfirm,
+      answer: (choices) =>
+        choices.find(
+          (choice) =>
+            choice.startsWith("Always allow (global)") && choice.includes("everything under it"),
+        ),
+    });
+
+    expect(
+      await host.toolCall(call("write", { path: "src/generated/a.ts", content: "x" }), host.ctx),
+    ).toBe(undefined);
+    expect(host.prompts[0]?.options.some((o) => o.startsWith("Always allow (this project)"))).toBe(
+      false,
+    );
+    expect(host.prompts[0]?.title).toMatch(/trustedProjects/);
+
+    const written = JSON.parse(readFileSync(host.globalFile, "utf8")) as {
+      tools: { write_file: { always_allow: unknown[] } };
+    };
+    expect(written.tools.write_file.always_allow).toContainEqual({ pattern: "^src/generated/" });
+
     expect(
       await host.toolCall(call("write", { path: "src/generated/b.ts", content: "y" }), host.ctx),
     ).toBe(undefined);

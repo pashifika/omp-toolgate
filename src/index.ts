@@ -157,6 +157,7 @@ export default function ompToolgate(pi: ExtensionApi): void {
       const plan = planApproval(decision, {
         globalPath: current.loaded.globalPath,
         projectPath: current.loaded.projectPath,
+        projectTrusted: current.loaded.trusted,
       });
       const title =
         plan.notes.length === 0

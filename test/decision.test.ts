@@ -15,6 +15,7 @@ import type {
   MappedCall,
   RuleOrigin,
   RuleScope,
+  SplitCommand,
   ToolPermissionMode,
   ToolPermissions,
   ToolRules,
@@ -57,9 +58,15 @@ interface ToolSpec {
   invalid?: { pattern: string; origin?: RuleOrigin }[];
 }
 
+/** The gate's own configuration files, as `loadPermissions` reports them. */
+const PROJECT_CONFIG = "/repo/.omp/tool-permissions.json";
+const GLOBAL_CONFIG = "/home/me/.omp/agent/tool-permissions.json";
+const PROTECTED: readonly string[] = [PROJECT_CONFIG, GLOBAL_CONFIG];
+
 function permissions(
   tools: Record<string, ToolSpec>,
   globalDefault: ToolPermissionMode = "confirm",
+  protectedPaths: readonly string[] = [],
 ): ToolPermissions {
   const compiled: Record<string, ToolRules> = {};
   for (const [name, spec] of Object.entries(tools)) {
@@ -75,7 +82,7 @@ function permissions(
       })),
     };
   }
-  return { default: globalDefault, tools: compiled };
+  return { default: globalDefault, tools: compiled, protectedPaths };
 }
 
 /** Decides several independent terminal commands as one virtual tool call. */
@@ -284,7 +291,7 @@ describe("spec: permission-decision", () => {
       readonly scenario: string;
       readonly command: string;
       /** `undefined` means the command could not be split. */
-      readonly split: readonly string[] | undefined;
+      readonly split: SplitCommand | undefined;
       readonly rules: ToolSpec;
       readonly expected: ToolPermissionMode;
       readonly reason: RegExp;
@@ -294,7 +301,7 @@ describe("spec: permission-decision", () => {
       {
         scenario: "splits a compound command and confirms on the injected half",
         command: "cd /tmp && rm -rf build",
-        split: ["cd /tmp", "rm -rf build"],
+        split: { commands: ["cd /tmp", "rm -rf build"], redirects: [] },
         rules: { confirm: ["\\brm\\b"] },
         expected: "confirm",
         reason: /always_confirm/,
@@ -303,7 +310,7 @@ describe("spec: permission-decision", () => {
         // `tail` matches no allow pattern, so the pipeline is not auto-approved.
         scenario: "splits a pipeline and ignores a file descriptor duplication",
         command: "cargo test 2>&1 | tail",
-        split: ["cargo test", "tail"],
+        split: { commands: ["cargo test", "tail"], redirects: [] },
         rules: { allow: ["^cargo\\s+test\\b"] },
         expected: "confirm",
         reason: /no rule matched/,
@@ -316,6 +323,34 @@ describe("spec: permission-decision", () => {
         expected: "confirm",
         reason: /could not be split/,
       },
+      {
+        // Review Major 2: the target is reported apart from the command, so
+        // `write_file` rules can reach it, and `^printf` alone cannot approve it.
+        scenario: "reports a write redirect target apart from the command",
+        command: "printf x >> ~/.ssh/authorized_keys",
+        split: { commands: ["printf x"], redirects: ["~/.ssh/authorized_keys"] },
+        rules: { allow: ["^printf"] },
+        expected: "confirm",
+        reason: /no rule matched/,
+      },
+      {
+        scenario: "reports a redirect with no command as a write of its target",
+        command: "> /etc/passwd",
+        split: { commands: [], redirects: ["/etc/passwd"] },
+        rules: { allow: ["^printf"] },
+        expected: "confirm",
+        reason: /no rule matched/,
+      },
+      {
+        // A read creates nothing, so its target is no `write_file` candidate; it
+        // stays a sub-command, which `^cat` still does not match.
+        scenario: "keeps a read redirect target among the sub-commands",
+        command: "cat < ~/.ssh/id_rsa",
+        split: { commands: ["cat", "< ~/.ssh/id_rsa"], redirects: [] },
+        rules: { allow: ["^cat"] },
+        expected: "confirm",
+        reason: /no rule matched/,
+      },
     ];
 
     it.each(cases)("$scenario", ({ command, split, rules, expected, reason }) => {
@@ -323,6 +358,98 @@ describe("spec: permission-decision", () => {
       const decision = terminal(command, rules);
       expect(decision.mode).toBe(expected);
       expect(decision.reason).toMatch(reason);
+    });
+
+    it("evaluates a write target as an input of its own", () => {
+      // The rendered entry is what the `terminal` rules see; `write_file` reaches
+      // the same target through the mapping step.
+      const decision = terminal("printf x > /etc/passwd", { allow: ["^printf"] });
+      expect(decision.inputs.map((input) => input.value)).toEqual(["printf x", "> /etc/passwd"]);
+    });
+  });
+
+  describe("expansions that rewrite their own text (review Major 1)", () => {
+    interface ExpansionCase {
+      readonly scenario: string;
+      readonly command: string;
+      /** Whether the command must still split into sub-commands. */
+      readonly splits: boolean;
+      /** Names the construct in the decision's reason, when it does not split. */
+      readonly failure?: RegExp;
+    }
+
+    const cases: readonly ExpansionCase[] = [
+      {
+        scenario: "refuses an ANSI-C quote, which bash expands to rm",
+        command: "$'\\x72\\x6d' -rf ~/Documents",
+        splits: false,
+        failure: /\$'…' or \$"…" quote rewrites its own contents/,
+      },
+      {
+        scenario: "refuses a locale quote",
+        command: '$"rm" -rf ~/Documents',
+        splits: false,
+        failure: /rewrites its own contents/,
+      },
+      {
+        scenario: "refuses a parameter expansion with a default operator",
+        command: "${x-r}${x-m} -rf ~",
+        splits: false,
+        failure: /the expansion \$\{x-r\} produces text that is not written/,
+      },
+      {
+        scenario: "refuses a substring expansion, the same trick with offsets",
+        command: "${x:0:2} -rf ~",
+        splits: false,
+        failure: /the expansion \$\{x:0:2\}/,
+      },
+      {
+        scenario: "refuses a pattern substitution inside double quotes",
+        command: 'echo "${x/a/rm}"',
+        splits: false,
+        failure: /the expansion \$\{x\/a\/rm\}/,
+      },
+      {
+        scenario: "keeps a braced variable reference, which expands to a value",
+        command: "rm -rf ${HOME}/build",
+        splits: true,
+      },
+      {
+        scenario: "keeps a bare variable reference",
+        command: "rm -rf $HOME/build",
+        splits: true,
+      },
+      {
+        scenario: "keeps a positional parameter",
+        command: "echo ${1}",
+        splits: true,
+      },
+    ];
+
+    it.each(cases)("$scenario", ({ command, splits, failure }) => {
+      expect(splitCommand(command) === undefined).toBe(!splits);
+      // `always_allow` of `.*` matches anything the splitter can read, so the
+      // tool default is reached only when the split refuses the command.
+      const decision = terminal(command, { allow: [".*"], default: "confirm" }, "allow");
+      expect(decision.mode).toBe(splits ? "allow" : "confirm");
+      expect(decision.cause.kind).toBe(splits ? "rule" : "default");
+      if (failure !== undefined) expect(decision.reason).toMatch(failure);
+    });
+
+    it("is the only guard, because no pattern sees the expanded command", () => {
+      // The README recommends `\b(rm|rmdir|…)\b` on `terminal`. bash runs
+      // `rm -rf ~/Documents` here; the text a rule matches against does not
+      // contain `rm` at all, so refusing to split is what stops it.
+      const command = "$'\\x72\\x6d' -rf ~/Documents";
+      expect(/\b(rm|rmdir)\b/i.test(command)).toBe(false);
+      const decision = terminal(command, {
+        default: "confirm",
+        allow: [".*"],
+        deny: ["\\b(rm|rmdir)\\b"],
+      });
+      expect(decision.mode).toBe("confirm");
+      expect(decision.cause.kind).toBe("default");
+      expect(decision.reason).toMatch(/always_allow was not evaluated/);
     });
   });
 
@@ -511,6 +638,162 @@ describe("spec: permission-decision", () => {
       expect(decision.cause.input).toBe("config/id_rsa");
     });
   });
+
+  describe("unparseable command floor", () => {
+    // Disabling `always_allow` is not enough when the default is permissive: the
+    // README's own terminal shape is `default: allow` guarded by always_confirm
+    // patterns, and those patterns never see what `$'\x72\x6d'` really runs.
+    const cases = [
+      {
+        scenario: "raises a permissive default to confirm",
+        command: "$'\\x72\\x6d' -rf ~/Documents",
+        toolDefault: "allow" as ToolPermissionMode,
+        expected: "confirm" as ToolPermissionMode,
+        cause: "unparseable" as DecisionCause["kind"],
+      },
+      {
+        scenario: "leaves a deny default alone",
+        command: "$'\\x72\\x6d' -rf ~/Documents",
+        toolDefault: "deny" as ToolPermissionMode,
+        expected: "deny" as ToolPermissionMode,
+        cause: "default" as DecisionCause["kind"],
+      },
+      {
+        scenario: "does not fire on a command it can split",
+        command: "rm -rf build",
+        toolDefault: "allow" as ToolPermissionMode,
+        expected: "allow" as ToolPermissionMode,
+        cause: "default" as DecisionCause["kind"],
+      },
+    ];
+
+    it.each(cases)("$scenario", ({ command, toolDefault, expected, cause }) => {
+      const decision = decide(
+        "terminal",
+        [{ value: command }],
+        permissions({ terminal: { default: toolDefault } }, "allow"),
+      );
+      expect(decision.mode).toBe(expected);
+      expect(decision.cause.kind).toBe(cause);
+    });
+
+    it("says why it could not read the command", () => {
+      const decision = decide(
+        "terminal",
+        [{ value: "${x-r}${x-m} -rf ~" }],
+        permissions({ terminal: { default: "allow" } }, "allow"),
+      );
+      expect(decision.reason).toMatch(/could not be split/);
+      expect(decision.reason).toMatch(/cannot be disabled by configuration/);
+    });
+  });
+
+  describe("protected configuration floor (review Major 4)", () => {
+    /** Decides one path input for `tool`, with the gate's own files protected. */
+    const guarded = (tool: string, input: DecisionInput, spec: ToolSpec): Decision =>
+      decide(tool, [input], permissions({ [tool]: spec }, "allow", PROTECTED));
+
+    const projectConfig: DecisionInput = {
+      value: ".omp/tool-permissions.json",
+      scope: "inside",
+      literal: PROJECT_CONFIG,
+      resolved: PROJECT_CONFIG,
+    };
+
+    interface ProtectedCase {
+      readonly scenario: string;
+      readonly tool: string;
+      readonly input: DecisionInput;
+      readonly rules: ToolSpec;
+      readonly expected: ToolPermissionMode;
+      readonly cause: DecisionCause["kind"];
+      readonly reason: RegExp;
+    }
+
+    const cases: readonly ProtectedCase[] = [
+      {
+        scenario: "raises allow to confirm for a write of the gate's own rules",
+        tool: "write_file",
+        input: projectConfig,
+        rules: { default: "allow", allow: [".*"] },
+        expected: "confirm",
+        cause: "protected",
+        reason: /own tool-permissions configuration.*cannot be disabled by configuration/s,
+      },
+      {
+        scenario: "keeps deny when always_deny matches the configuration path",
+        tool: "write_file",
+        input: projectConfig,
+        rules: { default: "allow", deny: ["tool-permissions"] },
+        expected: "deny",
+        cause: "rule",
+        reason: /always_deny/,
+      },
+      {
+        scenario: "leaves an existing confirm alone",
+        tool: "edit_file",
+        input: projectConfig,
+        rules: { default: "allow", confirm: ["\\.json$"] },
+        expected: "confirm",
+        cause: "rule",
+        reason: /always_confirm/,
+      },
+      {
+        scenario: "ignores a read of the same file, which changes no rule",
+        tool: "read_file",
+        input: projectConfig,
+        rules: { default: "allow" },
+        expected: "allow",
+        cause: "default",
+        reason: /no rule matched/,
+      },
+      {
+        scenario: "ignores an ordinary path",
+        tool: "write_file",
+        input: {
+          value: "src/a.ts",
+          scope: "inside",
+          literal: "/repo/src/a.ts",
+          resolved: "/repo/src/a.ts",
+        },
+        rules: { default: "allow" },
+        expected: "allow",
+        cause: "default",
+        reason: /no rule matched/,
+      },
+      {
+        // The literal path is an ordinary file; only the resolved path gives it
+        // away, and the protected floor is reported ahead of the escape floor.
+        scenario: "catches a symlink pointing at the global configuration",
+        tool: "delete_path",
+        input: {
+          value: "config/perms.json",
+          scope: "inside",
+          escaped: true,
+          literal: "/repo/config/perms.json",
+          resolved: GLOBAL_CONFIG,
+        },
+        rules: { default: "allow" },
+        expected: "confirm",
+        cause: "protected",
+        reason: /own tool-permissions configuration/,
+      },
+    ];
+
+    it.each(cases)("$scenario", ({ tool, input, rules, expected, cause, reason }) => {
+      const decision = guarded(tool, input, rules);
+      expect(decision.mode).toBe(expected);
+      expect(decision.cause.kind).toBe(cause);
+      expect(decision.reason).toMatch(reason);
+    });
+
+    it("applies even when the tool has no configuration entry", () => {
+      const decision = decide("write_file", [projectConfig], permissions({}, "allow", PROTECTED));
+      expect(decision.mode).toBe("confirm");
+      expect(decision.cause.kind).toBe("protected");
+      expect(decision.cause.input).toBe(".omp/tool-permissions.json");
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -654,7 +937,7 @@ describe("zed parity", () => {
   });
 
   it("empty_input_with_allow_falls_to_default", () => {
-    expect(splitCommand("")).toEqual([]);
+    expect(splitCommand("")).toEqual({ commands: [], redirects: [] });
     expect(terminal("", { allow: ["^ls"] }).mode).toBe("confirm");
   });
 
@@ -682,19 +965,22 @@ describe("zed parity", () => {
     // A redirection to /dev/null is known-safe and contributes no sub-command,
     // so it cannot stop every other sub-command from matching.
     const command = 'git log --oneline -20 2>/dev/null || echo "not a git repo or no commits"';
-    expect(splitCommand(command)).toEqual([
-      "git log --oneline -20",
-      "echo not a git repo or no commits",
-    ]);
+    expect(splitCommand(command)).toEqual({
+      commands: ["git log --oneline -20", "echo not a git repo or no commits"],
+      redirects: [],
+    });
     expect(terminal(command, { allow: ["^git\\s+(status|diff|log|show)\\b", "^echo"] }).mode).toBe(
       "allow",
     );
   });
 
   it("redirect_to_real_file_still_causes_confirm", () => {
-    // A redirection to a real file contributes its own sub-command, which an
-    // allow pattern on the command name alone does not match.
-    expect(splitCommand("echo hello > /etc/passwd")).toEqual(["echo hello", "> /etc/passwd"]);
+    // A redirection to a real file is checked in its own right, which an allow
+    // pattern on the command name alone does not match.
+    expect(splitCommand("echo hello > /etc/passwd")).toEqual({
+      commands: ["echo hello"],
+      redirects: ["/etc/passwd"],
+    });
     expect(terminal("echo hello > /etc/passwd", { allow: ["^echo"] }).mode).toBe("confirm");
   });
 
@@ -705,11 +991,10 @@ describe("zed parity", () => {
     // because the substituted commands are extracted and checked in their own
     // right.
     const command = "echo $(cat $(whoami).txt)";
-    expect(splitCommand(command)).toEqual([
-      "echo $(cat $(whoami).txt)",
-      "cat $(whoami).txt",
-      "whoami",
-    ]);
+    expect(splitCommand(command)).toEqual({
+      commands: ["echo $(cat $(whoami).txt)", "cat $(whoami).txt", "whoami"],
+      redirects: [],
+    });
     expect(terminal(command, { allow: ["^echo"] }).mode).not.toBe("allow");
     // The divergence, stated outright: a configuration that really does allow
     // every extracted command allows the whole thing.

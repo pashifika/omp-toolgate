@@ -454,10 +454,104 @@ const EXEC_CASES: MapCase[] = [
     expected: [{ virtualTool: "terminal", values: ["sudo ls"] }],
   },
   {
+    // Major 2: `write_file.always_deny` on `.ssh` must reach the redirect target,
+    // which used to be judged against `terminal` patterns only.
+    case: "maps a redirect target to write_file alongside terminal",
+    tool: "bash",
+    input: { command: "printf x >> ~/.ssh/authorized_keys" },
+    expected: [
+      { virtualTool: "terminal", values: ["printf x >> ~/.ssh/authorized_keys"] },
+      { virtualTool: "write_file", values: ["/home/u/.ssh/authorized_keys"] },
+    ],
+  },
+  {
+    // Nothing but a redirection: no sub-command, and still a file to check.
+    case: "maps a command that is only a redirect to write_file too",
+    tool: "bash",
+    input: { command: "> ~/.ssh/authorized_keys" },
+    expected: [
+      { virtualTool: "terminal", values: ["> ~/.ssh/authorized_keys"] },
+      { virtualTool: "write_file", values: ["/home/u/.ssh/authorized_keys"] },
+    ],
+  },
+  {
+    case: "maps every redirect target of a compound command",
+    tool: "bash",
+    input: { command: "printf x > a.txt && printf y > /tmp/b.txt" },
+    expected: [
+      { virtualTool: "terminal", values: ["printf x > a.txt && printf y > /tmp/b.txt"] },
+      { virtualTool: "write_file", values: ["a.txt", "/tmp/b.txt"] },
+    ],
+  },
+  {
+    // The change must not widen every command into a write: a read redirect and
+    // `/dev/null` are not writes, and neither is an angle bracket in a word.
+    case: "leaves a command without a write redirect as one terminal call",
+    tool: "bash",
+    input: { command: 'git commit -m "fix: a > b" < msg.txt 2>/dev/null' },
+    expected: [
+      { virtualTool: "terminal", values: ['git commit -m "fix: a > b" < msg.txt 2>/dev/null'] },
+    ],
+  },
+  {
+    // An unsplittable command disables `always_allow` in the decision step; it
+    // must not invent a target here either.
+    case: "emits no write_file call when the command cannot be split",
+    tool: "bash",
+    input: { command: "printf x > 'unclosed" },
+    expected: [{ virtualTool: "terminal", values: ["printf x > 'unclosed"] }],
+  },
+  {
     case: "maps a process launch to terminal as one command string",
     tool: "hub",
     input: { op: "start", name: "web", application: "bun", args: ["run", "dev"] },
     expected: [{ virtualTool: "terminal", values: ["bun run dev"] }],
+  },
+  {
+    case: "maps a redirect inside a launch line to write_file too",
+    tool: "hub",
+    input: { op: "start", name: "sh", application: "sh", args: ["-c", "printf x > out.txt"] },
+    expected: [
+      { virtualTool: "terminal", values: ["sh -c printf x > out.txt"] },
+      { virtualTool: "write_file", values: ["out.txt"] },
+    ],
+  },
+  {
+    // B3: gating `start` while leaving `send` open left every line typed into a
+    // started `/bin/sh` ungated.
+    case: "maps process stdin to terminal with the text as the command",
+    tool: "hub",
+    input: { op: "send", name: "sh", text: "rm -rf ~/Documents" },
+    expected: [{ virtualTool: "terminal", values: ["rm -rf ~/Documents"] }],
+  },
+  {
+    case: "maps a redirect typed into a process to write_file too",
+    tool: "hub",
+    input: { op: "send", name: "sh", text: "cat >> ~/.ssh/authorized_keys" },
+    expected: [
+      { virtualTool: "terminal", values: ["cat >> ~/.ssh/authorized_keys"] },
+      { virtualTool: "write_file", values: ["/home/u/.ssh/authorized_keys"] },
+    ],
+  },
+  {
+    // A key sequence is not a command string, but it still reaches the process.
+    case: "maps a key sequence to terminal with no inputs",
+    tool: "hub",
+    input: { op: "send", name: "sh", keys: ["CTRL_C"] },
+    expected: [{ virtualTool: "terminal", values: [] }],
+  },
+  {
+    case: "maps a signal to terminal with no inputs",
+    tool: "hub",
+    input: { op: "send", name: "sh", signal: "SIGKILL" },
+    expected: [{ virtualTool: "terminal", values: [] }],
+  },
+  {
+    // A payload this mapping cannot read is not an absent payload.
+    case: "maps a send whose text is not a string to terminal with no inputs",
+    tool: "hub",
+    input: { op: "send", name: "sh", text: 42 },
+    expected: [{ virtualTool: "terminal", values: [] }],
   },
   {
     case: "does not map hub messaging",
@@ -482,6 +576,25 @@ const EXEC_CASES: MapCase[] = [
     tool: "xd://debug",
     input: { action: "continue" },
     expected: [],
+  },
+  {
+    // The adapter's expression evaluator reaches `platform shell` in lldb.
+    case: "maps a debug expression evaluation to terminal",
+    tool: "xd://debug",
+    input: { action: "evaluate", expression: "platform shell rm -rf ~/Documents" },
+    expected: [{ virtualTool: "terminal", values: ["platform shell rm -rf ~/Documents"] }],
+  },
+  {
+    case: "maps a debug custom_request to terminal",
+    tool: "xd://debug",
+    input: { action: "custom_request", command: "runInTerminal", arguments: { args: ["sh"] } },
+    expected: [{ virtualTool: "terminal", values: ["runInTerminal"] }],
+  },
+  {
+    case: "applies the terminal default when a debug evaluation has no expression",
+    tool: "xd://debug",
+    input: { action: "evaluate", frame_id: 1 },
+    expected: [{ virtualTool: "terminal", values: [] }],
   },
   {
     // `terminal.always_confirm: ["\\brm\\b"]` must never see this source text.
@@ -548,9 +661,22 @@ const EXEC_CASES: MapCase[] = [
     input: { action: "code_actions", file: "src/a.ts", apply: true },
     expected: [{ virtualTool: "edit_file", values: [] }],
   },
+  {
+    // A raw request may be `workspace/executeCommand`, whose `workspace/applyEdit`
+    // response is applied to disk.
+    case: "maps a raw lsp request to edit_file with no inputs",
+    tool: "xd://lsp",
+    input: { action: "request", query: "workspace/executeCommand", payload: "{}" },
+    expected: [{ virtualTool: "edit_file", values: [] }],
+  },
 ];
 
-/** hub operations that start no process, and lsp actions that write nothing. */
+/**
+ * hub operations that reach no process input, and lsp actions that write
+ * nothing. `cancel` / `stop` / `restart` only address a process whose launch
+ * line was judged at `start`. `diagnostics` stays here deliberately: the
+ * language server compiles the project whether or not the call is gated.
+ */
 const READ_ONLY_OPS = [
   { tool: "hub", key: "op", value: "wait" },
   { tool: "hub", key: "op", value: "inbox" },
@@ -818,6 +944,15 @@ const SCOPE_CASES: ScopeCase[] = [
     tool: "edit",
     input: { input: "[src/a.ts#1A2B]\nMV /tmp/a.ts" },
     scopes: ["inside", "outside"],
+  },
+  {
+    // The command string carries no scope; the file it redirects into does, so a
+    // `{"scope": "outside"}` rule can claim the target without claiming the
+    // command.
+    case: "a redirect target, which is a path while the command is not",
+    tool: "bash",
+    input: { command: "printf x >> ~/.ssh/authorized_keys" },
+    scopes: [undefined, "outside"],
   },
 ];
 

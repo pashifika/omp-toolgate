@@ -2,18 +2,17 @@
  * `project_root` resolution and path normalization (design D3, D4, D8).
  *
  * Everything a rule is matched against goes through here first, so a raw tool
- * argument never reaches a pattern: `..` is collapsed, `~` is expanded, omp
- * selector syntax is removed, symlinks are resolved and the result is expressed
- * relative to `project_root` when it stays inside it.
+ * argument never reaches a pattern: a recognized omp selector is removed, `~` is
+ * expanded, symlinks are resolved one component at a time and the result is
+ * expressed relative to `project_root` when it stays inside it.
  *
  * POSIX paths only; Windows is an explicit non-goal.
  */
 
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-
-import type { NormalizedPath, PathResolver, PathScope } from "./types.ts";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isRecord, type NormalizedPath, type PathResolver } from "./types.ts";
 
 /**
  * The dominant marker. A `.git` file counts as much as a `.git` directory
@@ -44,6 +43,21 @@ const LANGUAGE_MARKERS: readonly string[] = [
 const COLON = 0x3a;
 const SLASH = 0x2f;
 
+/** One line range: `50`, `50-`, `50-200`, `50+150`. */
+const RANGE = String.raw`\d+(?:-\d*|\+\d+)?`;
+
+/** One selector component: a mode, or a comma-separated list of ranges. */
+const SELECTOR_PART = `raw|conflicts|${RANGE}(?:,${RANGE})*`;
+
+/** A whole range/mode tail, at most two components (`raw:2-4`, `2-4:raw`). */
+const SELECTOR_TAIL = new RegExp(`^(?:${SELECTOR_PART})(?::(?:${SELECTOR_PART}))?$`);
+
+/** Prefixes after which any tail, `/` included, is an archive member path. */
+const ARCHIVE_SUFFIX = /\.(?:zip|tar\.gz|tar|tgz|jar|war|ear|apk)$/i;
+
+/** Prefixes after which a `/`-free tail is a `table` or `table:key` selector. */
+const SQLITE_SUFFIX = /\.(?:sqlite3|sqlite|db3|db)$/i;
+
 /**
  * Resolves the project root for a session.
  *
@@ -62,7 +76,7 @@ export function resolveProjectRoot(cwd: string, env: NodeJS.ProcessEnv): string 
   }
 
   const start = resolve(cwd);
-  const candidates = ancestorsBelowHome(start, resolve(env["HOME"] ?? homedir()));
+  const candidates = ancestorsBelowHome(start, resolve(env["HOME"] || homedir()));
 
   for (const dir of candidates) {
     if (existsSync(join(dir, GIT_MARKER))) {
@@ -89,32 +103,37 @@ export interface StrippedSelector {
 /**
  * Splits omp selector syntax off a path argument.
  *
- * The cut happens at the first `:` that is not immediately followed by `//`,
- * which covers every selector family with one rule: archive members
- * (`dist/app.zip:META-INF/MANIFEST.MF`), SQLite (`data/app.sqlite:users:42`) and
- * line ranges (`src/main.ts:50-200`, `:raw`, `:5-16,960-973`). Skipping `://`
- * keeps a scheme intact, so `https://host/a` is returned unchanged while an
- * internal URL still accepts a selector (`local://plan.md:1-10`).
+ * The cut is taken at the first `:` not immediately followed by `//`, which
+ * keeps a scheme intact — `https://host/a` is returned unchanged while
+ * `local://plan.md:1-10` still yields a selector — and only when the tail is
+ * recognizable as one: a range or mode (`:50-200`, `:raw:2-4`), an archive
+ * member after an archive suffix (`dist/app.zip:META-INF/MANIFEST.MF`), or a
+ * `/`-free table selector after a SQLite suffix (`data/app.sqlite:users:42`).
+ *
+ * Any other tail stays in the path. omp writes a colon path it recognizes as
+ * neither selector to that literal name (`omp://tools/write.md`), so cutting an
+ * unknown tail would gate `x` while `x:/../../../.ssh/authorized_keys` is the
+ * file created — and would shorten an ordinary `backup-12:30:45.tar` past every
+ * rule written for it.
  */
 export function stripSelectors(raw: string): StrippedSelector {
-  for (let i = 0; i < raw.length; i += 1) {
-    if (raw.charCodeAt(i) !== COLON) {
-      continue;
-    }
-    if (raw.charCodeAt(i + 1) === SLASH && raw.charCodeAt(i + 2) === SLASH) {
-      i += 2;
-      continue;
-    }
-    return { path: raw.slice(0, i), selector: raw.slice(i + 1) };
+  const cut = candidateColon(raw);
+  if (cut < 0) {
+    return { path: raw, selector: undefined };
   }
-  return { path: raw, selector: undefined };
+  const prefix = raw.slice(0, cut);
+  const tail = raw.slice(cut + 1);
+  if (!isSelectorTail(prefix, tail)) {
+    return { path: raw, selector: undefined };
+  }
+  return { path: prefix, selector: tail };
 }
 
 /**
  * Normalizes one raw path argument against a project root.
  *
  * Prefer {@link createPathResolver} when several arguments share a root: this
- * entry point canonicalizes `projectRoot` on every call.
+ * entry point canonicalizes `cwd` and `projectRoot` on every call.
  */
 export function normalizePath(
   raw: string,
@@ -122,47 +141,69 @@ export function normalizePath(
   projectRoot: string,
   env?: NodeJS.ProcessEnv,
 ): NormalizedPath {
-  return normalizeAgainstRoot(raw, resolve(cwd), realpathDeepest(resolve(projectRoot)), env);
+  return createPathResolver(cwd, projectRoot, env)(raw);
 }
 
 /**
  * Builds a {@link PathResolver} bound to one `cwd`, `project_root` and `env`.
  *
- * The project root is canonicalized once here, not per call.
+ * Both directories are canonicalized here, once per closure. They have to be:
+ * `escaped` compares the literal path with the root, so a `/var/…` spelling of a
+ * `/private/var/…` directory makes every containment test false and silently
+ * disables the escape floor.
  */
 export function createPathResolver(
   cwd: string,
   projectRoot: string,
   env?: NodeJS.ProcessEnv,
 ): PathResolver {
-  const base = resolve(cwd);
-  const root = realpathDeepest(resolve(projectRoot));
+  // A relative `cwd` or `project_root` can only mean "relative to the process".
+  const processCwd = process.cwd();
+  const base = walkComponents(cwd, processCwd);
+  const root = walkComponents(projectRoot, processCwd);
   return (raw: string): NormalizedPath => normalizeAgainstRoot(raw, base, root, env);
 }
 
 /**
- * Normalizes against an already resolved `cwd` and an already canonicalized
- * `root`.
+ * Canonicalizes one path into the coordinate system every containment test in
+ * this package uses: symlinks resolved component by component, relative input
+ * taken against the process directory.
+ *
+ * Exported because `src/config.ts` builds `ToolPermissions.protectedPaths` and
+ * `src/decision.ts` compares those entries against a `NormalizedPath`. Two
+ * spellings of one directory made that comparison silently false once already
+ * (`/var/…` versus `/private/var/…`), so both sides go through this.
+ */
+export function canonicalizePath(target: string): string {
+  return walkComponents(target, process.cwd());
+}
+
+/**
+ * Normalizes against a `base` and `root` already canonicalized by
+ * {@link createPathResolver}.
  *
  * `escaped` marks the case design D8 is about: the literal path is inside the
  * project but symlink resolution leaves it. The matched string is then the
  * resolved absolute path, so an `always_deny` on `(^|/)\.ssh(/|$)` still catches
  * `<repo>/config/id_rsa` when `<repo>/config` points at `~/.ssh`.
+ *
+ * `literal` keeps the textual reading of the same argument, so the two together
+ * say both what was asked for and what would be opened.
  */
 function normalizeAgainstRoot(
   raw: string,
-  cwd: string,
+  base: string,
   root: string,
   env: NodeJS.ProcessEnv | undefined,
 ): NormalizedPath {
   const stripped = stripSelectors(raw);
-  const literal = resolve(cwd, expandHome(stripped.path, env));
-  const resolved = realpathDeepest(literal);
+  const target = expandHome(stripped.path, env);
+  const literal = resolve(base, target);
+  const resolved = walkComponents(target, base);
   const inside = isWithin(resolved, root);
-  const scope: PathScope = inside ? "inside" : "outside";
   return {
     path: inside ? toProjectRelative(root, resolved) : resolved,
-    scope,
+    scope: inside ? "inside" : "outside",
     escaped: !inside && isWithin(literal, root),
     literal,
     resolved,
@@ -192,43 +233,119 @@ function ancestorsBelowHome(start: string, home: string): readonly string[] {
   return chain;
 }
 
+/**
+ * Index of the first `:` that could open a selector, or `-1` when there is none.
+ *
+ * `://` is a scheme separator, so `https://host/a` has no candidate at all while
+ * `local://plan.md:1-10` finds the colon after the path.
+ */
+function candidateColon(raw: string): number {
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw.charCodeAt(i) !== COLON) {
+      continue;
+    }
+    if (raw.charCodeAt(i + 1) === SLASH && raw.charCodeAt(i + 2) === SLASH) {
+      i += 2;
+      continue;
+    }
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * Whether the text after the colon is a selector rather than part of the name.
+ *
+ * An empty tail is a trailing colon in a filename, never a selector. A tail
+ * holding a `/` is one only inside an archive, where it is a member path.
+ */
+function isSelectorTail(prefix: string, tail: string): boolean {
+  if (tail === "") {
+    return false;
+  }
+  if (ARCHIVE_SUFFIX.test(prefix)) {
+    return true;
+  }
+  if (tail.includes("/")) {
+    return false;
+  }
+  return SQLITE_SUFFIX.test(prefix) || SELECTOR_TAIL.test(tail);
+}
+
 /** Expands a leading `~` or `~/`. `~user` is a non-goal and stays literal. */
 function expandHome(target: string, env: NodeJS.ProcessEnv | undefined): string {
   if (target !== "~" && !target.startsWith("~/")) {
     return target;
   }
-  const home = env?.["HOME"] ?? homedir();
+  // An empty HOME must fall back, not expand to "": `resolve("")` is the process
+  // working directory, which would place a home path inside the project.
+  const home = env?.["HOME"] || homedir();
   return target === "~" ? home : join(home, target.slice(2));
 }
 
 /**
- * Resolves symlinks as far as the filesystem allows.
+ * Resolves `target` component by component from `base`, following each symlink
+ * before the next component is applied. `base` matters only for a relative
+ * `target`.
  *
- * The deepest existing ancestor is passed through `realpath` and the remaining
- * segments are re-joined, so a path whose parents do not exist yet still
- * normalizes. An unreadable ancestor degrades to the literal path rather than
- * throwing.
+ * This is the path the kernel will open. `path.resolve` collapses `link/..`
+ * textually and never sees the symlink, so a path that leaves the project
+ * through one is reported as staying inside it. Resolution stops at the first
+ * component that cannot be resolved and the remainder is joined as written, so
+ * a file whose parents do not exist yet still normalizes.
  */
-function realpathDeepest(absolute: string): string {
-  let current = absolute;
-  const pending: string[] = [];
-  for (;;) {
+function walkComponents(target: string, base: string): string {
+  let current = isAbsolute(target) ? sep : base;
+  let resolving = true;
+  for (const part of target.split("/")) {
+    if (part === "" || part === ".") {
+      continue;
+    }
+    if (part === "..") {
+      current = dirname(current);
+      continue;
+    }
+    const joined = join(current, part);
+    if (!resolving) {
+      current = joined;
+      continue;
+    }
     try {
-      const real = realpathSync(current);
-      if (pending.length === 0) {
-        return real;
+      current = realpathSync(joined);
+    } catch (error) {
+      const code = isRecord(error) ? error["code"] : undefined;
+      // A dangling symlink still names where a write lands: `open(…, O_CREAT)`
+      // creates the link's target, not the link. `realpathSync` refuses it, so
+      // read the link and keep resolving from there.
+      const linked = code === "ENOENT" ? readLink(joined) : undefined;
+      if (linked !== undefined) {
+        current = linked;
+        continue;
       }
-      pending.reverse();
-      return join(real, ...pending);
-    } catch {
-      const parent = dirname(current);
-      if (parent === current) {
-        return absolute;
-      }
-      pending.push(basename(current));
-      current = parent;
+      // A component that cannot exist has no symlink to follow, so the rest is
+      // taken as written and a later `..` may resume in existing territory. Any
+      // other failure (EACCES, ELOOP) means the target cannot be named at all:
+      // stop resolving rather than pass a literal spelling off as canonical.
+      current = joined;
+      resolving = code === "ENOENT" || code === "ENOTDIR";
     }
   }
+  return current;
+}
+
+/**
+ * The target of `candidate` when it is a symlink whose own target is missing,
+ * resolved against the link's directory. `undefined` when `candidate` is not a
+ * link at all.
+ */
+function readLink(candidate: string): string | undefined {
+  let target: string;
+  try {
+    target = readlinkSync(candidate);
+  } catch {
+    return undefined;
+  }
+  return isAbsolute(target) ? target : join(dirname(candidate), target);
 }
 
 /** Expresses `target` relative to `root`; the root itself becomes `""`. */

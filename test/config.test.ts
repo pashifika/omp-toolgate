@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 
 import JSON5 from "json5";
 
@@ -602,6 +602,93 @@ describe("merging an untrusted project", () => {
 
     expect(rulesFor(loaded, "write_file").default).toBe("confirm");
   });
+
+  it("discards the project's always_allow instead of unioning it into the global list", () => {
+    // Reproduction B1: `always_allow` is evaluated ahead of every `default`, so
+    // a union let one committed rule switch the gate off for that tool.
+    const workspace = createWorkspace("allow-vs-global-deny", {
+      global: { default: "deny" },
+      project: { tools: { write_file: { always_allow: [{ scope: "any" }] } } },
+    });
+
+    const loaded = load(workspace);
+
+    expect(loaded.trusted).toBe(false);
+    expect(loaded.permissions?.default).toBe("deny");
+    expect(rulesFor(loaded, "write_file").always_allow).toEqual([]);
+    const warning = warningMatching(loaded, /discarded/);
+    expect(warning).toContain(workspace.projectPath);
+    expect(warning).toContain('"write_file"');
+    expect(warning).toMatch(/\b1 "always_allow" rule/);
+  });
+
+  it("discards an empty terminal pattern, which would otherwise match every command", () => {
+    // Reproduction B1, second half: `""` matches `rm -rf ~/Documents`.
+    const loaded = loadFixture("allow-vs-global-confirm", {
+      global: { default: "confirm" },
+      project: { tools: { terminal: { always_allow: [""] } } },
+    });
+
+    expect(loaded.permissions?.default).toBe("confirm");
+    expect(rulesFor(loaded, "terminal").always_allow).toEqual([]);
+    expect(warningMatching(loaded, /discarded/)).toContain('"terminal"');
+  });
+
+  it("keeps the global always_allow while discarding the project's", () => {
+    const loaded = loadFixture("allow-global-kept", {
+      global: { default: "confirm", tools: { write_file: { always_allow: ["^dist/"] } } },
+      project: { tools: { write_file: { always_allow: ["\\.env$"] } } },
+    });
+
+    expect(rulesFor(loaded, "write_file").always_allow.map((rule) => rule.source)).toEqual([
+      "^dist/",
+    ]);
+  });
+
+  it("reports the discard once per virtual tool, with that tool's count", () => {
+    const workspace = createWorkspace("allow-two-tools", {
+      global: { default: "confirm" },
+      project: {
+        tools: {
+          write_file: { always_allow: ["^a", "^b"] },
+          terminal: { always_allow: ["^c"] },
+        },
+      },
+    });
+
+    const loaded = load(workspace);
+
+    expect(loaded.warnings).toEqual([
+      `${workspace.projectPath}: discarded 2 "always_allow" rule(s) for "write_file": an untrusted project may only tighten the global rules, and "always_allow" outranks every default`,
+      `${workspace.projectPath}: discarded 1 "always_allow" rule(s) for "terminal": an untrusted project may only tighten the global rules, and "always_allow" outranks every default`,
+    ]);
+    expect(rulesFor(loaded, "write_file").always_allow).toEqual([]);
+    expect(rulesFor(loaded, "terminal").always_allow).toEqual([]);
+  });
+
+  it("stays quiet when the project mentions always_allow without a rule", () => {
+    const loaded = loadFixture("allow-empty", {
+      global: { tools: { write_file: { always_allow: ["^dist/"] } } },
+      project: { tools: { write_file: { always_allow: [] } } },
+    });
+
+    expect(loaded.warnings).toEqual([]);
+    expect(rulesFor(loaded, "write_file").always_allow.map((rule) => rule.source)).toEqual([
+      "^dist/",
+    ]);
+  });
+
+  it("keeps the stricter tool default when the project asks for allow next to an allow rule", () => {
+    // `mergeDefault` already takes the stricter side; asserted here so the
+    // `always_allow` discard is not the only thing standing in the way.
+    const loaded = loadFixture("allow-default-and-rule", {
+      global: { default: "confirm", tools: { write_file: { default: "confirm" } } },
+      project: { tools: { write_file: { default: "allow", always_allow: ["\\.env$"] } } },
+    });
+
+    expect(rulesFor(loaded, "write_file").default).toBe("confirm");
+    expect(rulesFor(loaded, "write_file").always_allow).toEqual([]);
+  });
 });
 
 describe("trustedProjects", () => {
@@ -659,6 +746,25 @@ describe("trustedProjects", () => {
       "\\.env$",
     ]);
     expect(rulesFor(loaded, "write_file").default).toBe("allow");
+  });
+
+  it("honours a trusted project's always_allow", () => {
+    // The escape hatch the untrusted discard must not take away.
+    const workspace = createWorkspace("trusted-allow", {
+      project: { tools: { write_file: { always_allow: ["\\.env$"] } } },
+    });
+    writeConfig(workspace.globalPath, {
+      trustedProjects: [workspace.projectRoot],
+      default: "deny",
+    });
+
+    const loaded = load(workspace);
+
+    expect(loaded.trusted).toBe(true);
+    expect(rulesFor(loaded, "write_file").always_allow.map((rule) => rule.source)).toEqual([
+      "\\.env$",
+    ]);
+    expect(loaded.warnings).toEqual([]);
   });
 
   it("ignores trustedProjects written in the project file", () => {
@@ -773,7 +879,7 @@ describe("untrusted project pattern limits", () => {
     expect(warningMatching(loaded, /dropped/)).toMatch(/\b1 rule/);
   });
 
-  it("counts one budget across the three lists of a tool", () => {
+  it("counts one budget across the lists that survive the always_allow discard", () => {
     const loaded = loadFixture("cross-list-limit", {
       project: {
         tools: {
@@ -787,10 +893,12 @@ describe("untrusted project pattern limits", () => {
     });
 
     const rules = rulesFor(loaded, "terminal");
-    expect(rules.always_allow).toHaveLength(40);
-    expect(rules.always_confirm).toHaveLength(PROJECT_PATTERN_LIMIT - 40);
-    expect(rules.always_deny).toHaveLength(0);
-    expect(warningMatching(loaded, /dropped/)).toMatch(/\b56 rule/);
+    // The discarded allow rules do not spend the budget, so the two tightening
+    // lists share all 64 of it.
+    expect(rules.always_allow).toEqual([]);
+    expect(rules.always_confirm).toHaveLength(40);
+    expect(rules.always_deny).toHaveLength(PROJECT_PATTERN_LIMIT - 40);
+    expect(warningMatching(loaded, /dropped/)).toMatch(/\b16 rule/);
   });
 
   it("does not limit the global file", () => {
@@ -833,6 +941,37 @@ describe("default inheritance", () => {
 
     expect(loaded.permissions?.default).toBe("allow");
     expect(rulesFor(loaded, "write_file").default).toBeUndefined();
+  });
+});
+
+describe("protectedPaths", () => {
+  it.each([
+    { label: "both files exist", fixture: { global: { default: "deny" }, project: {} } },
+    { label: "only the global file exists", fixture: { global: { default: "deny" } } },
+    { label: "only the project file exists", fixture: { project: { default: "deny" } } },
+  ])("floors both configuration files when $label", ({ fixture }) => {
+    const workspace = createWorkspace("protected", fixture);
+
+    const loaded = load(workspace);
+
+    expect(loaded.permissions?.protectedPaths).toEqual([
+      workspace.globalPath,
+      workspace.projectPath,
+    ]);
+  });
+
+  it("resolves a relative project root to an absolute protected path", () => {
+    const workspace = createWorkspace("protected-relative", { global: { default: "deny" } });
+    const relativeRoot = relative(process.cwd(), workspace.projectRoot);
+
+    const loaded = loadPermissions(relativeRoot, workspace.env, JSON5.parse);
+
+    // The reported path stays as the caller wrote it; the protected one does not.
+    expect(isAbsolute(loaded.projectPath)).toBe(false);
+    expect(loaded.permissions?.protectedPaths).toEqual([
+      workspace.globalPath,
+      workspace.projectPath,
+    ]);
   });
 });
 

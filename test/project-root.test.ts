@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
 import {
@@ -19,11 +19,16 @@ import {
  * normalized one by that prefix. All fixture paths are therefore canonical, so
  * only the symlinks created below make `realpath` observable.
  *
+ * `rawBase` keeps the pre-`realpath` spelling of the same tree, which the
+ * non-canonical base cases need: on macOS that is the `/var/folders/…` reading
+ * of a `/private/var/folders/…` directory, and on Linux it is `base` itself.
+ *
  * `<base>/home` acts as `$HOME`, which keeps the "walk stops below the home
  * directory" fixtures separate from `<base>/elsewhere`, a tree that is not under
  * the home directory at all.
  */
-const base = realpathSync(mkdtempSync(join(tmpdir(), "toolgate-project-root-")));
+const rawBase = mkdtempSync(join(tmpdir(), "toolgate-project-root-"));
+const base = realpathSync(rawBase);
 const home = join(base, "home");
 const proj = join(base, "proj");
 const env: NodeJS.ProcessEnv = { HOME: home };
@@ -83,6 +88,8 @@ const symlinkFixtureError = ((): string | undefined => {
     symlinkSync(join(proj, "src"), join(proj, "link"), "dir");
     // An alias of the project root itself, to check root canonicalization.
     symlinkSync(proj, join(base, "proj-link"), "dir");
+    // A cycle: `realpath` fails with ELOOP rather than "does not exist".
+    symlinkSync(join(proj, "loop"), join(proj, "loop"), "dir");
     return undefined;
   } catch (error) {
     return String(error);
@@ -188,6 +195,15 @@ describe("resolveProjectRoot", () => {
   ])("resolves $scenario", ({ cwd, env: rowEnv, expected }) => {
     expect(resolveProjectRoot(cwd, rowEnv)).toBe(expected);
   });
+
+  it("falls back to the real home directory when HOME is empty", () => {
+    // `resolve("")` is the process working directory, so an empty HOME made this
+    // repository the walk boundary: the walk stopped inside it and never reached
+    // its own marker. `no-such-dir` need not exist — only marker lookups touch
+    // the filesystem.
+    const cwd = join(process.cwd(), "no-such-dir/deeper");
+    expect(resolveProjectRoot(cwd, { HOME: "" })).toBe(process.cwd());
+  });
 });
 
 describe("stripSelectors", () => {
@@ -252,6 +268,78 @@ describe("stripSelectors", () => {
       raw: "local://plan.md:1-10",
       path: "local://plan.md",
       selector: "1-10",
+    },
+    {
+      scenario: "a single line number",
+      raw: "src/main.ts:50",
+      path: "src/main.ts",
+      selector: "50",
+    },
+    {
+      scenario: "an open-ended range",
+      raw: "src/main.ts:50-",
+      path: "src/main.ts",
+      selector: "50-",
+    },
+    {
+      scenario: "a length range",
+      raw: "src/main.ts:50+150",
+      path: "src/main.ts",
+      selector: "50+150",
+    },
+    {
+      scenario: "a conflicts modifier",
+      raw: "src/main.ts:conflicts",
+      path: "src/main.ts",
+      selector: "conflicts",
+    },
+    {
+      scenario: "a range followed by a modifier",
+      raw: "src/main.ts:2-4:raw",
+      path: "src/main.ts",
+      selector: "2-4:raw",
+    },
+    {
+      scenario: "a gzipped tar member, whose inner path carries slashes",
+      raw: "dist/app.tar.gz:pkg/lib/mod.js",
+      path: "dist/app.tar.gz",
+      selector: "pkg/lib/mod.js",
+    },
+    {
+      scenario: "a SQLite table with no key",
+      raw: "data/app.sqlite:users",
+      path: "data/app.sqlite",
+      selector: "users",
+    },
+    {
+      scenario: "a .db row key, which mapping recognizes by the colon it keeps",
+      raw: "data/app.db:users:42",
+      path: "data/app.db",
+      selector: "users:42",
+    },
+    {
+      scenario: "a tail matching no selector grammar, which stays in the path",
+      raw: "./x:/../../../../Users/me/.ssh/authorized_keys",
+      path: "./x:/../../../../Users/me/.ssh/authorized_keys",
+      selector: undefined,
+    },
+    {
+      scenario: "a timestamped filename, which is not a range",
+      raw: "backup-12:30:45.tar",
+      path: "backup-12:30:45.tar",
+      selector: undefined,
+    },
+    {
+      scenario: "a trailing colon, which is part of the filename",
+      raw: "file.ts:",
+      path: "file.ts:",
+      selector: undefined,
+    },
+    {
+      scenario: "a slash in the tail of a plain file, which is no member path",
+      raw: "notes:2026/plan.md",
+      path: "notes:2026/plan.md",
+      selector: undefined,
     },
   ])("splits $scenario", ({ raw, path, selector }) => {
     expect(stripSelectors(raw)).toEqual({ path, selector });
@@ -350,12 +438,54 @@ describe("normalizePath", () => {
       escaped: false,
       selector: "50-200",
     },
+    {
+      scenario: "a timestamped filename, keeping every colon",
+      raw: "backup-12:30:45.tar",
+      cwd: proj,
+      root: proj,
+      path: "backup-12:30:45.tar",
+      scope: "inside",
+      escaped: false,
+      selector: undefined,
+    },
+    {
+      scenario: "a trailing colon, keeping it in the path",
+      raw: "src/main.ts:",
+      cwd: proj,
+      root: proj,
+      path: "src/main.ts:",
+      scope: "inside",
+      escaped: false,
+      selector: undefined,
+    },
   ])("normalizes $scenario", ({ raw, cwd, root, path, scope, escaped, selector }) => {
     const result = normalizePath(raw, cwd, root, env);
     expect(result.path).toBe(path);
     expect(result.scope).toBe(scope);
     expect(result.escaped).toBe(escaped);
     expect(result.selector).toBe(selector);
+  });
+
+  it("keeps a colon tail that is no selector, so the gate judges what omp writes", () => {
+    // The old cut left `./x` for the rules while omp created `x:` and walked out
+    // of the project through the `..` segments behind it.
+    const raw = "./x:/../../../../Users/me/.ssh/authorized_keys";
+    const result = normalizePath(raw, proj, proj, env);
+    expect(result.selector).toBeUndefined();
+    expect(result.scope).toBe("outside");
+    expect(result.escaped).toBe(false);
+    expect(isAbsolute(result.path)).toBe(true);
+    expect(result.path).not.toContain("..");
+    expect(result.path).toMatch(/(^|\/)\.ssh\/authorized_keys$/);
+  });
+
+  it("expands a tilde against the real home directory when HOME is empty", () => {
+    // An empty HOME used to expand `~/x` to the relative `x`, which then landed
+    // inside the project. `realpathSync` for the reason the fixture uses it: the
+    // expected value is the resolved path.
+    const result = normalizePath("~/x", proj, proj, { HOME: "" });
+    expect(result.path).toBe(join(realpathSync(homedir()), "x"));
+    expect(result.scope).toBe("outside");
   });
 
   it("reports the absolute literal and resolved paths beside the match string", () => {
@@ -423,6 +553,69 @@ describe("symlink escape", () => {
     expect(result.scope).toBe("inside");
     expect(result.path).toBe("src/main.ts");
   });
+
+  itWithSymlinks("follows a symlink whose target does not exist yet", () => {
+    // `open(…, O_CREAT)` through a dangling link creates the link's TARGET, so a
+    // write through one lands wherever the link points. `realpathSync` refuses a
+    // dangling link, which used to leave the literal link name as the answer and
+    // let a write to a not-yet-created file outside the project look inside it.
+    const dangling = join(proj, "pending");
+    symlinkSync(join(home, ".ssh/authorized_keys"), dangling);
+    const result = normalizePath(dangling, proj, proj, env);
+    expect(result.resolved).toBe(join(home, ".ssh/authorized_keys"));
+    expect(result.scope).toBe("outside");
+    expect(result.escaped).toBe(true);
+  });
+
+  itWithSymlinks("applies `..` to what a symlink points at, not to the name", () => {
+    // `<proj>/secrets` -> `<home>/.ssh`, so `secrets/..` is `<home>`. Collapsing
+    // the pair textually first reported `.ssh/id_rsa` as inside the project.
+    const result = normalizePath("secrets/../.ssh/id_rsa", proj, proj, env);
+    expect(result.scope).toBe("outside");
+    expect(result.escaped).toBe(true);
+    expect(result.literal).toBe(join(proj, ".ssh/id_rsa"));
+    expect(result.resolved).toBe(join(home, ".ssh/id_rsa"));
+    expect(result.path).toMatch(/(^|\/)\.ssh(\/|$)/);
+  });
+
+  itWithSymlinks("applies `..` after a symlink that stays inside the project", () => {
+    const result = normalizePath("link/../.env", proj, proj, env);
+    expect(result.scope).toBe("inside");
+    expect(result.escaped).toBe(false);
+    expect(result.path).toBe(".env");
+  });
+
+  itWithSymlinks("flags an escape when the base is spelled through a symlink", () => {
+    const alias = join(base, "proj-link");
+    const result = normalizePath("secrets/id_rsa", alias, alias, env);
+    expect(result.escaped).toBe(true);
+    expect(result.scope).toBe("outside");
+    expect(result.literal).toBe(join(proj, "secrets/id_rsa"));
+  });
+
+  itWithSymlinks("flags an escape when the base is not canonical", () => {
+    // The `/var` reading of a `/private/var` temp directory: comparing an
+    // uncanonicalized literal with a canonicalized root made every escape look
+    // like an ordinary path outside the project.
+    const rawProj = join(rawBase, "proj");
+    const result = normalizePath("secrets/id_rsa", rawProj, rawProj, env);
+    expect(result.escaped).toBe(true);
+    expect(result.scope).toBe("outside");
+    expect(result.literal).toBe(join(proj, "secrets/id_rsa"));
+  });
+
+  itWithSymlinks("stops resolving at a symlink cycle instead of reading past it", () => {
+    // ELOOP is not "does not exist": the position is unknown, so the remainder
+    // stays literal rather than being resolved from a guess.
+    const result = normalizePath("loop/../link/main.ts", proj, proj, env);
+    expect(result.scope).toBe("inside");
+    expect(result.path).toBe("link/main.ts");
+  });
+
+  itWithSymlinks("resumes resolution after a component that does not exist", () => {
+    const result = normalizePath("newdir/../link/main.ts", proj, proj, env);
+    expect(result.path).toBe("src/main.ts");
+  });
 });
 
 describe("createPathResolver", () => {
@@ -443,6 +636,12 @@ describe("createPathResolver", () => {
   itWithSymlinks("canonicalizes a symlinked project root once", () => {
     const resolvePath = createPathResolver(proj, join(base, "proj-link"), env);
     expect(resolvePath("src/main.ts").path).toBe("src/main.ts");
+    expect(resolvePath("secrets/id_rsa").escaped).toBe(true);
+  });
+
+  itWithSymlinks("canonicalizes a non-canonical cwd once", () => {
+    const resolvePath = createPathResolver(join(base, "proj-link"), proj, env);
+    expect(resolvePath("main.ts").path).toBe("main.ts");
     expect(resolvePath("secrets/id_rsa").escaped).toBe(true);
   });
 });

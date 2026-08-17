@@ -17,12 +17,13 @@
  * extraction below covers the injection vector that rejection was guarding.
  */
 
-import { MODE_STRICTNESS } from "./types.ts";
+import { MODE_STRICTNESS, MUTATING_VIRTUAL_TOOLS } from "./types.ts";
 import type {
   CompiledRule,
   Decision,
   DecisionInput,
   MappedCall,
+  SplitCommand,
   ToolPermissionMode,
   ToolPermissions,
   ToolRules,
@@ -36,6 +37,12 @@ const DEV_NULL = "/dev/null";
 
 /** Guards against a stack overflow on pathologically nested substitutions. */
 const MAX_NESTING_DEPTH = 32;
+
+/**
+ * A `${…}` body that is a bare parameter name or positional number, and so
+ * expands to a value rather than to text derived from one.
+ */
+const PLAIN_PARAMETER = /^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+)$/;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -62,34 +69,51 @@ export function decide(
   }
 
   if (rules === undefined) {
-    return escapeFloor({
-      mode: permissions.default,
-      virtualTool,
-      reason: `${virtualTool}: no rules configured, so the global default (${permissions.default}) applies.`,
-      cause: { kind: "default" },
-      inputs,
-    });
+    return escapeFloor(
+      protectedFloor(
+        {
+          mode: permissions.default,
+          virtualTool,
+          reason: `${virtualTool}: no rules configured, so the global default (${permissions.default}) applies.`,
+          cause: { kind: "default" },
+          inputs,
+        },
+        permissions.protectedPaths,
+      ),
+    );
   }
 
   let evaluated = inputs;
-  let allowEnabled = true;
+  let splitFailure: string | undefined;
   if (virtualTool === TERMINAL_TOOL) {
     const expanded: DecisionInput[] = [];
     for (const input of inputs) {
-      const parts = splitCommand(input.value);
-      if (parts === undefined) {
+      const attempt = trySplitCommand(input.value);
+      if (attempt.split === undefined) {
         // Unparseable command: check it whole and refuse to auto-approve it.
-        allowEnabled = false;
+        splitFailure ??= attempt.failure;
         expanded.push(input);
         continue;
       }
-      for (const part of parts) expanded.push({ ...input, value: part });
+      for (const command of attempt.split.commands) expanded.push({ ...input, value: command });
+      // Write targets are checked here as well as by `write_file` (which the
+      // mapping step derives from the same list), so an `always_allow` on the
+      // command name alone cannot approve `printf x > .env`.
+      for (const target of attempt.split.redirects) {
+        expanded.push({ ...input, value: `> ${target}` });
+      }
     }
     evaluated = expanded;
   }
 
   return escapeFloor(
-    checkInputs(virtualTool, evaluated, rules, allowEnabled, permissions.default),
+    protectedFloor(
+      unparseableFloor(
+        checkInputs(virtualTool, evaluated, rules, splitFailure, permissions.default),
+        splitFailure,
+      ),
+      permissions.protectedPaths,
+    ),
   );
 }
 
@@ -140,28 +164,34 @@ export function matchesRule(rule: CompiledRule, input: DecisionInput): boolean {
 }
 
 /**
- * Splits a shell command into the sub-commands that each need to be checked.
+ * Splits a shell command into the pieces that each need to be checked: the
+ * sub-commands, and the files the command writes through a redirection.
  *
  * Returns `undefined` when the command cannot be split with confidence, which
  * disables `always_allow` for that command rather than guessing.
  *
  * Words are unquoted and rejoined with single spaces, mirroring Zed's
  * `extract_commands`, so `r'm' -rf '/'` is checked as `rm -rf /` and quoting
- * cannot be used to slip past a pattern. Parameter expansions keep their source
- * text (`rm -rf $HOME` stays `rm -rf $HOME`), while the contents of command
- * substitutions, subshells and process substitutions are extracted as their own
- * sub-commands. A redirection to a real file contributes a `> <target>`
- * pseudo sub-command so an `always_allow` on the command name alone cannot
- * approve `printf x > .env`; a redirection to `/dev/null` or to another file
- * descriptor contributes nothing.
+ * cannot be used to slip past a pattern. A plain parameter expansion keeps its
+ * source text (`rm -rf $HOME` stays `rm -rf $HOME`), while the contents of
+ * command substitutions, subshells and process substitutions are extracted as
+ * their own sub-commands. An expansion whose result cannot be known from the
+ * text — `$'\x72\x6d'`, `${x-rm}` — is refused outright rather than emitted as
+ * a literal that no rule would match.
+ *
+ * `redirects` holds the write targets (`>`, `>>`, `>|`, `&>`, `<>`), bare and
+ * unquoted, so that `write_file` rules can be applied to them too. A read
+ * redirection creates nothing, so its target stays a `< <target>` entry among
+ * the sub-commands instead: `terminal` still sees it, but it must not be
+ * mistaken for a write. A redirection to `/dev/null`, a file descriptor
+ * duplication, and a here-document contribute nothing at all.
  *
  * Constructs this splitter does not model (brace groups, control-flow keywords)
  * simply leave their keywords as extra sub-commands. That can only make
  * `always_allow` harder to satisfy, never easier.
  */
-export function splitCommand(command: string): readonly string[] | undefined {
-  const out: string[] = [];
-  return collectCommands(command, out, 0) ? out : undefined;
+export function splitCommand(command: string): SplitCommand | undefined {
+  return trySplitCommand(command).split;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +224,8 @@ function checkInputs(
   virtualTool: string,
   inputs: readonly DecisionInput[],
   rules: ToolRules,
-  allowEnabled: boolean,
+  /** When set, `always_allow` is skipped and this says why, for the reason text. */
+  splitFailure: string | undefined,
   globalDefault: ToolPermissionMode,
 ): Decision {
   let confirmHit: RuleHit | undefined;
@@ -255,7 +286,7 @@ function checkInputs(
     };
   }
 
-  if (allowEnabled && allMatchedAllow && hadAnyInputs && allowHit !== undefined) {
+  if (splitFailure === undefined && allMatchedAllow && hadAnyInputs && allowHit !== undefined) {
     return {
       mode: "allow",
       virtualTool,
@@ -278,9 +309,11 @@ function checkInputs(
 
   const mode = rules.default ?? globalDefault;
   const which = rules.default === undefined ? "global default" : `${virtualTool} default`;
-  const note = allowEnabled
-    ? ""
-    : " always_allow was not evaluated because the command could not be split into sub-commands.";
+  const note =
+    splitFailure === undefined
+      ? ""
+      : " always_allow was not evaluated because the command could not be split into " +
+        `sub-commands: ${splitFailure}.`;
   return {
     mode,
     virtualTool,
@@ -314,6 +347,30 @@ function denyForInvalidPatterns(
 }
 
 /**
+ * Raises `allow` to `confirm` when the command could not be split.
+ *
+ * Disabling `always_allow` is not enough on its own: with a `default` of `allow`
+ * — which the README's own recommended shape uses for `terminal`, protecting
+ * itself with `always_confirm` patterns — an unparseable command would sail past
+ * the pattern lists that were never able to see what it really runs. `$'\x72\x6d'`
+ * expands to `rm` in the shell and matches no `\brm\b` rule as written, so the
+ * only honest answer is to ask.
+ */
+function unparseableFloor(decision: Decision, splitFailure: string | undefined): Decision {
+  if (splitFailure === undefined || decision.mode !== "allow") return decision;
+  return {
+    mode: "confirm",
+    virtualTool: decision.virtualTool,
+    reason:
+      `${decision.virtualTool}: confirmation required because the command could not be split into ` +
+      `sub-commands (${splitFailure}), so the rules could not be matched against what the shell ` +
+      `would actually run. This cannot be disabled by configuration.`,
+    cause: { kind: "unparseable" },
+    inputs: decision.inputs,
+  };
+}
+
+/**
  * Raises `allow` to `confirm` when any input escaped the project root through a
  * symlink (design D8). It is a floor rather than a short circuit, so a matching
  * `always_deny` still wins and configuration cannot disable it.
@@ -335,6 +392,41 @@ function escapeFloor(decision: Decision): Decision {
   };
 }
 
+/**
+ * Raises `allow` to `confirm` when a mutating tool targets one of the gate's own
+ * configuration files. Without it a single `write_file.default: allow` lets the
+ * agent rewrite the rules that were about to gate it, and the rewrite goes live
+ * on the next reload. Both the literal and the resolved path are compared: the
+ * literal catches the file named directly, the resolved one catches a symlink
+ * pointing at it.
+ *
+ * Like `escapeFloor` it only ever raises `allow`, so the two compose in either
+ * order and either one firing is enough. Callers run this one first, so that a
+ * symlink into the configuration is reported as the configuration rather than as
+ * a generic escape.
+ */
+function protectedFloor(decision: Decision, protectedPaths: readonly string[]): Decision {
+  if (decision.mode !== "allow" || MUTATING_VIRTUAL_TOOLS[decision.virtualTool] !== true) {
+    return decision;
+  }
+  const hit = decision.inputs.find(
+    (input) =>
+      protectedPaths.includes(input.resolved ?? "") || protectedPaths.includes(input.literal ?? ""),
+  );
+  if (hit === undefined) return decision;
+
+  return {
+    mode: "confirm",
+    virtualTool: decision.virtualTool,
+    reason:
+      `${decision.virtualTool}: confirmation required because ${JSON.stringify(hit.value)} is this ` +
+      `gate's own tool-permissions configuration (${hit.resolved ?? hit.literal}). This cannot be ` +
+      `disabled by configuration.`,
+    cause: { kind: "protected", input: hit.value },
+    inputs: decision.inputs,
+  };
+}
+
 function describeRule(rule: CompiledRule): string {
   if (rule.regex === undefined) return `scope ${rule.scope}`;
   return rule.scope === "any" ? `/${rule.source}/` : `/${rule.source}/ with scope ${rule.scope}`;
@@ -343,6 +435,37 @@ function describeRule(rule: CompiledRule): string {
 // ---------------------------------------------------------------------------
 // Shell command splitting
 // ---------------------------------------------------------------------------
+
+/** What one split attempt produced. `split` is `undefined` exactly when `failure` is set. */
+interface SplitAttempt {
+  readonly split: SplitCommand | undefined;
+  /** Phrase naming what defeated the splitter, for the decision's reason text. */
+  readonly failure: string | undefined;
+}
+
+/** Mutable state of one split pass: the two output lists and the first failure. */
+interface Parse {
+  readonly commands: string[];
+  readonly redirects: string[];
+  failure: string | undefined;
+}
+
+/**
+ * `splitCommand` with the rejection reason kept, so that a user who suddenly
+ * stops matching an `always_allow` can be told which construct cost them it.
+ */
+function trySplitCommand(command: string): SplitAttempt {
+  const parse: Parse = { commands: [], redirects: [], failure: undefined };
+  if (!collectCommands(command, parse, 0)) {
+    // The fallback is load-bearing, not decoration: `decide` treats a failure
+    // without text as no failure at all and would re-enable `always_allow`.
+    return { split: undefined, failure: parse.failure ?? "it is not valid shell syntax" };
+  }
+  return {
+    split: { commands: parse.commands, redirects: parse.redirects },
+    failure: undefined,
+  };
+}
 
 /** A word read from the command, both unquoted and as written. */
 interface WordRead {
@@ -353,50 +476,60 @@ interface WordRead {
   readonly next: number;
 }
 
-/** A redirection, reduced to the pseudo sub-command it contributes (if any). */
+/** A redirection, reduced to the file it touches, if it touches one at all. */
 interface RedirectRead {
-  readonly pseudo: string | undefined;
+  readonly target: string | undefined;
+  /** Whether the redirection creates or truncates `target`. */
+  readonly writes: boolean;
   readonly next: number;
 }
 
 /**
- * Appends every sub-command of one command list to `out`.
- * Returns `false` when the text cannot be split with confidence.
+ * Appends every sub-command of one command list to `parse.commands` and every
+ * write target to `parse.redirects`. Returns `false` when the text cannot be
+ * split with confidence, leaving the reason in `parse.failure`.
  */
-function collectCommands(text: string, out: string[], depth: number): boolean {
-  if (depth > MAX_NESTING_DEPTH) return false;
+function collectCommands(text: string, parse: Parse, depth: number): boolean {
+  if (depth > MAX_NESTING_DEPTH) {
+    parse.failure ??= `substitutions are nested more than ${MAX_NESTING_DEPTH} deep`;
+    return false;
+  }
 
   let words: string[] = [];
-  let redirects: string[] = [];
+  let reads: string[] = [];
+  let writes: string[] = [];
   let nested: string[] = [];
-  let anyCommand = false;
-  let anyRedirect = false;
 
   /**
    * Ends the current segment. `binaryBefore` / `binaryAfter` say whether the
    * segment is an operand of `&&`, `||` or `|`, which may not be empty.
    */
   const endSegment = (binaryBefore: boolean, binaryAfter: boolean): boolean => {
-    if (words.length === 0 && redirects.length === 0 && nested.length === 0) {
-      return !binaryBefore && !binaryAfter;
+    if (words.length === 0 && reads.length === 0 && writes.length === 0 && nested.length === 0) {
+      if (!binaryBefore && !binaryAfter) return true;
+      parse.failure ??= "an operand of &&, || or | is empty";
+      return false;
     }
     const joined = words.join(" ").trim();
-    if (joined !== "") {
-      out.push(joined);
-      anyCommand = true;
-    }
-    for (const redirect of redirects) {
-      out.push(redirect);
-      anyRedirect = true;
-    }
+    if (joined !== "") parse.commands.push(joined);
+    // A read target is no command, but leaving it out would let an
+    // `always_allow` of `^cat` approve `cat < ~/.ssh/id_rsa`.
+    for (const read of reads) parse.commands.push(`< ${read}`);
+    for (const write of writes) parse.redirects.push(write);
     for (const inner of nested) {
-      if (!collectCommands(inner, out, depth + 1)) return false;
-      anyCommand = true;
+      if (!collectCommands(inner, parse, depth + 1)) return false;
     }
     words = [];
-    redirects = [];
+    reads = [];
+    writes = [];
     nested = [];
     return true;
+  };
+
+  /** Sorts the file a redirection touches, if any, into the two output lists. */
+  const takeRedirect = (redirect: RedirectRead): void => {
+    if (redirect.target === undefined) return;
+    (redirect.writes ? writes : reads).push(redirect.target);
   };
 
   let i = 0;
@@ -427,9 +560,9 @@ function collectCommands(text: string, out: string[], depth: number): boolean {
         continue;
       }
       if (next === ">") {
-        const redirect = readRedirect(text, i, "", nested);
+        const redirect = readRedirect(text, i, nested, parse);
         if (redirect === undefined) return false;
-        if (redirect.pseudo !== undefined) redirects.push(redirect.pseudo);
+        takeRedirect(redirect);
         i = redirect.next;
         continue;
       }
@@ -447,9 +580,9 @@ function collectCommands(text: string, out: string[], depth: number): boolean {
     }
 
     if (c === "<" || c === ">") {
-      const redirect = readRedirect(text, i, "", nested);
+      const redirect = readRedirect(text, i, nested, parse);
       if (redirect === undefined) return false;
-      if (redirect.pseudo !== undefined) redirects.push(redirect.pseudo);
+      takeRedirect(redirect);
       i = redirect.next;
       continue;
     }
@@ -457,21 +590,27 @@ function collectCommands(text: string, out: string[], depth: number): boolean {
     // A subshell contributes its contents, not a command of its own.
     if (c === "(") {
       const close = findClosingParen(text, i + 1);
-      if (close < 0) return false;
+      if (close < 0) {
+        parse.failure ??= "a ( group is not closed";
+        return false;
+      }
       nested.push(text.slice(i + 1, close));
       i = close + 1;
       continue;
     }
-    if (c === ")") return false;
+    if (c === ")") {
+      parse.failure ??= "a ) has no opening (";
+      return false;
+    }
 
-    const word = readWord(text, i, nested);
+    const word = readWord(text, i, nested, parse);
     if (word === undefined) return false;
     const after = text.charAt(word.next);
     if (/^[0-9]+$/.test(word.raw) && (after === "<" || after === ">")) {
       // `2>file`: the digits are a file descriptor, not a command word.
-      const redirect = readRedirect(text, word.next, word.raw, nested);
+      const redirect = readRedirect(text, word.next, nested, parse);
       if (redirect === undefined) return false;
-      if (redirect.pseudo !== undefined) redirects.push(redirect.pseudo);
+      takeRedirect(redirect);
       i = redirect.next;
       continue;
     }
@@ -479,14 +618,16 @@ function collectCommands(text: string, out: string[], depth: number): boolean {
     i = word.next;
   }
 
-  if (!endSegment(binaryBefore, false)) return false;
-  // A redirection with no command anywhere, such as `> /etc/passwd`, is not
-  // something we can reason about.
-  return anyCommand || !anyRedirect;
+  return endSegment(binaryBefore, false);
 }
 
 /** Reads one word, stopping before whitespace or any shell metacharacter. */
-function readWord(text: string, start: number, nested: string[]): WordRead | undefined {
+function readWord(
+  text: string,
+  start: number,
+  nested: string[],
+  parse: Parse,
+): WordRead | undefined {
   let value = "";
   let i = start;
 
@@ -509,7 +650,10 @@ function readWord(text: string, start: number, nested: string[]): WordRead | und
     }
 
     if (c === "\\") {
-      if (i + 1 >= text.length) return undefined;
+      if (i + 1 >= text.length) {
+        parse.failure ??= "it ends in a backslash";
+        return undefined;
+      }
       const escaped = text.charAt(i + 1);
       // A backslash-newline is a line continuation and contributes nothing.
       if (escaped !== "\n") value += escaped;
@@ -519,14 +663,17 @@ function readWord(text: string, start: number, nested: string[]): WordRead | und
 
     if (c === "'") {
       const close = text.indexOf("'", i + 1);
-      if (close < 0) return undefined;
+      if (close < 0) {
+        parse.failure ??= "a single quote is not closed";
+        return undefined;
+      }
       value += text.slice(i + 1, close);
       i = close + 1;
       continue;
     }
 
     if (c === '"') {
-      const quotedPart = readDoubleQuoted(text, i, nested);
+      const quotedPart = readDoubleQuoted(text, i, nested, parse);
       if (quotedPart === undefined) return undefined;
       value += quotedPart.text;
       i = quotedPart.next;
@@ -534,19 +681,37 @@ function readWord(text: string, start: number, nested: string[]): WordRead | und
     }
 
     if (c === "`") {
-      const substitution = readBackquote(text, i, nested);
+      const substitution = readBackquote(text, i, nested, parse);
       if (substitution === undefined) return undefined;
       value += substitution.source;
       i = substitution.next;
       continue;
     }
 
-    if (c === "$" && text.charAt(i + 1) === "(") {
-      const substitution = readDollarParen(text, i, nested);
-      if (substitution === undefined) return undefined;
-      value += substitution.source;
-      i = substitution.next;
-      continue;
+    if (c === "$") {
+      const next = text.charAt(i + 1);
+      // ANSI-C and locale quoting rewrite their own contents, so what bash will
+      // run is not the text in front of us: `$'\x72\x6d'` is `rm`. Emitting the
+      // visible characters would hand `always_allow` a command nothing matches.
+      if (next === "'" || next === '"') {
+        parse.failure ??=
+          "a $'…' or $\"…\" quote rewrites its own contents (for example $'\\x72\\x6d' is rm)";
+        return undefined;
+      }
+      if (next === "(") {
+        const substitution = readDollarParen(text, i, nested, parse);
+        if (substitution === undefined) return undefined;
+        value += substitution.source;
+        i = substitution.next;
+        continue;
+      }
+      if (next === "{") {
+        const braced = readBraced(text, i, parse);
+        if (braced === undefined) return undefined;
+        value += braced.source;
+        i = braced.next;
+        continue;
+      }
     }
 
     value += c;
@@ -561,6 +726,7 @@ function readDoubleQuoted(
   text: string,
   start: number,
   nested: string[],
+  parse: Parse,
 ): { text: string; next: number } | undefined {
   let value = "";
   let i = start + 1;
@@ -570,7 +736,10 @@ function readDoubleQuoted(
     if (c === '"') return { text: value, next: i + 1 };
 
     if (c === "\\") {
-      if (i + 1 >= text.length) return undefined;
+      if (i + 1 >= text.length) {
+        parse.failure ??= "a double quote is not closed";
+        return undefined;
+      }
       const escaped = text.charAt(i + 1);
       // Inside double quotes a backslash only escapes these four characters and
       // a newline; anywhere else it stays a literal backslash.
@@ -584,25 +753,37 @@ function readDoubleQuoted(
     }
 
     if (c === "`") {
-      const substitution = readBackquote(text, i, nested);
+      const substitution = readBackquote(text, i, nested, parse);
       if (substitution === undefined) return undefined;
       value += substitution.source;
       i = substitution.next;
       continue;
     }
 
-    if (c === "$" && text.charAt(i + 1) === "(") {
-      const substitution = readDollarParen(text, i, nested);
-      if (substitution === undefined) return undefined;
-      value += substitution.source;
-      i = substitution.next;
-      continue;
+    if (c === "$") {
+      const next = text.charAt(i + 1);
+      if (next === "(") {
+        const substitution = readDollarParen(text, i, nested, parse);
+        if (substitution === undefined) return undefined;
+        value += substitution.source;
+        i = substitution.next;
+        continue;
+      }
+      // `$'…'` is literal inside double quotes, but `${x-rm}` still expands.
+      if (next === "{") {
+        const braced = readBraced(text, i, parse);
+        if (braced === undefined) return undefined;
+        value += braced.source;
+        i = braced.next;
+        continue;
+      }
     }
 
     value += c;
     i += 1;
   }
 
+  parse.failure ??= "a double quote is not closed";
   return undefined;
 }
 
@@ -610,9 +791,13 @@ function readDollarParen(
   text: string,
   at: number,
   nested: string[],
+  parse: Parse,
 ): { source: string; next: number } | undefined {
   const close = findClosingParen(text, at + 2);
-  if (close < 0) return undefined;
+  if (close < 0) {
+    parse.failure ??= "a $(…) substitution is not closed";
+    return undefined;
+  }
   nested.push(text.slice(at + 2, close));
   return { source: text.slice(at, close + 1), next: close + 1 };
 }
@@ -621,30 +806,58 @@ function readBackquote(
   text: string,
   at: number,
   nested: string[],
+  parse: Parse,
 ): { source: string; next: number } | undefined {
   const close = findClosingBacktick(text, at + 1);
-  if (close < 0) return undefined;
+  if (close < 0) {
+    parse.failure ??= "a ` substitution is not closed";
+    return undefined;
+  }
   nested.push(text.slice(at + 1, close));
   return { source: text.slice(at, close + 1), next: close + 1 };
 }
 
 /**
+ * Reads a `${…}` expansion, which may only be kept as source text when it is a
+ * plain parameter reference. Every other body selects or rewrites text that is
+ * not in the command — `${x-rm}`, `${x:0:2}`, `${x/a/b}`, `${!x}` — so it is
+ * refused rather than emitted as a literal no rule matches. `$VAR` without
+ * braces is a plain reference by construction and stays as written.
+ */
+function readBraced(
+  text: string,
+  at: number,
+  parse: Parse,
+): { source: string; next: number } | undefined {
+  const close = text.indexOf("}", at + 2);
+  if (close < 0) {
+    parse.failure ??= "a ${…} expansion is not closed";
+    return undefined;
+  }
+  const body = text.slice(at + 2, close);
+  const source = text.slice(at, close + 1);
+  if (!PLAIN_PARAMETER.test(body)) {
+    parse.failure ??= `the expansion ${source} produces text that is not written in the command`;
+    return undefined;
+  }
+  return { source, next: close + 1 };
+}
+
+/**
  * Reads one redirection starting at `at`, which points at `<`, `>` or the `&`
- * of `&>`. `fd` is the file descriptor prefix already consumed, if any.
+ * of `&>`. A file descriptor prefix has already been consumed by the caller; it
+ * changes which stream is redirected, never which file.
  */
 function readRedirect(
   text: string,
   at: number,
-  fd: string,
   nested: string[],
+  parse: Parse,
 ): RedirectRead | undefined {
   let i = at;
   let operator: string;
-  let fdPrefix = fd;
 
   if (text.charAt(i) === "&") {
-    // `&>` and `&>>` never carry a file descriptor prefix.
-    fdPrefix = "";
     i += 2;
     if (text.charAt(i) === ">") {
       operator = "&>>";
@@ -685,26 +898,39 @@ function readRedirect(
   // A process substitution target contributes its contents, not a file.
   if (text.charAt(i) === "(") {
     const close = findClosingParen(text, i + 1);
-    if (close < 0) return undefined;
+    if (close < 0) {
+      parse.failure ??= "a process substitution is not closed";
+      return undefined;
+    }
     nested.push(text.slice(i + 1, close));
-    return { pseudo: undefined, next: close + 1 };
+    return { target: undefined, writes: false, next: close + 1 };
   }
 
-  const target = readWord(text, i, nested);
-  if (target === undefined || target.raw === "") return undefined;
+  const target = readWord(text, i, nested, parse);
+  if (target === undefined) return undefined;
+  if (target.raw === "") {
+    parse.failure ??= "a redirection has no target";
+    return undefined;
+  }
 
   // Here-documents and here-strings feed data in, so only their expansions (now
-  // in `nested`) matter. Duplicating a file descriptor touches no file either.
-  if (operator === "<<" || operator === "<<<") return { pseudo: undefined, next: target.next };
-  if (
-    (operator === ">&" || operator === "<&") &&
-    (/^[0-9]+$/.test(target.text) || target.text === "-")
-  ) {
-    return { pseudo: undefined, next: target.next };
-  }
-  if (target.text === DEV_NULL) return { pseudo: undefined, next: target.next };
+  // in `nested`) matter. Duplicating or closing a descriptor touches no file
+  // either, and `/dev/null` needs no permission in either direction.
+  const inert =
+    operator === "<<" ||
+    operator === "<<<" ||
+    ((operator === ">&" || operator === "<&") &&
+      (/^[0-9]+$/.test(target.text) || target.text === "-")) ||
+    target.text === DEV_NULL;
+  if (inert) return { target: undefined, writes: false, next: target.next };
 
-  return { pseudo: `${fdPrefix}${operator} ${target.text}`, next: target.next };
+  // Only `<` and `<&file` leave the file untouched; `<>` opens it for writing
+  // too, and every `>` form creates or truncates it.
+  return {
+    target: target.text,
+    writes: operator !== "<" && operator !== "<&",
+    next: target.next,
+  };
 }
 
 /** Index of the `)` closing the group whose body starts at `from`, or -1. */

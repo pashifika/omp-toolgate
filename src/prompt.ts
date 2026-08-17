@@ -46,6 +46,41 @@ export interface ApprovalPlan {
 export interface ApprovalPaths {
   readonly globalPath: string;
   readonly projectPath: string;
+  /**
+   * Whether the project root is listed in the global file's `trustedProjects`.
+   * An untrusted project file may only tighten, so its `always_allow` is
+   * discarded on load — offering to record one there would be a dead choice.
+   */
+  readonly projectTrusted: boolean;
+}
+
+/**
+ * Widest model-supplied value the dialog renders. A longer one is truncated so
+ * that a padded argument cannot scroll the gate's own lines out of view.
+ */
+const MAX_RENDERED_WIDTH = 200;
+
+/** Visible spellings for the control characters that would otherwise forge a line. */
+const CONTROL_ESCAPES: Readonly<Record<string, string>> = {
+  "\n": "\\n",
+  "\r": "\\r",
+  "\t": "\\t",
+};
+
+/**
+ * Renders one model-supplied string for a line-oriented dialog. The body is
+ * joined with `\n`, so a newline inside a tool argument — or inside a pattern
+ * echoed from an untrusted project file — would add lines indistinguishable
+ * from the gate's own. Every interpolation of untrusted text goes through here.
+ */
+function renderText(text: string): string {
+  const visible = text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu, (char) => {
+    const known = CONTROL_ESCAPES[char];
+    if (known !== undefined) return known;
+    return `\\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`;
+  });
+  if (visible.length <= MAX_RENDERED_WIDTH) return visible;
+  return `${visible.slice(0, MAX_RENDERED_WIDTH)}… (truncated, ${visible.length} characters)`;
 }
 
 /**
@@ -101,42 +136,59 @@ function shellWords(segment: string): string[] {
 }
 
 /**
- * Builds the anchored pattern for one sub-command, or `undefined` when no safe
+ * One "always allow" offer: the pattern that would be recorded, plus what that
+ * pattern widens to. The reach travels with the pattern so that no label can
+ * present a home-subtree or an extension-wide rule as if it were this one call.
+ */
+interface Candidate {
+  readonly pattern: string;
+  /** Completes "covers …". */
+  readonly covers: string;
+}
+
+/**
+ * Builds the anchored candidate for one sub-command, or `undefined` when no safe
  * pattern exists. `cargo test --release` yields `^cargo\s+test(\s|$)`;
  * `ls -la` yields `^ls\b` because a flag is not a sub-command; `./deploy.sh` and
  * a leading `VAR=value` assignment yield nothing, the latter because an anchored
  * pattern would never match the assignment-prefixed command anyway.
  */
-function commandPattern(segment: string): string | undefined {
+function commandCandidate(segment: string): Candidate | undefined {
   const words = shellWords(segment.trim());
   const command = words[0];
   if (command === undefined || !isPlainCommandToken(command)) return undefined;
   const next = words[1];
   if (next !== undefined && !next.startsWith("-") && isPlainCommandToken(next)) {
-    return `^${escapePattern(command)}\\s+${escapePattern(next)}(\\s|$)`;
+    return {
+      pattern: `^${escapePattern(command)}\\s+${escapePattern(next)}(\\s|$)`,
+      covers: `every "${command} ${next}" command, with any arguments`,
+    };
   }
-  return `^${escapePattern(command)}\\b`;
+  return { pattern: `^${escapePattern(command)}\\b`, covers: `every ${command} command` };
 }
 
 /**
- * Patterns offered for "always allow", in the order they should be presented.
+ * Candidates offered for "always allow", narrowest first.
  *
  * `terminal` produces one anchored pattern per sub-command; the inputs of a
  * `terminal` decision are already split, so no further splitting happens here.
- * Path tools produce the enclosing directory and the file extension. Every other
+ * A path tool leads with the exact path, so approving one call can be recorded
+ * without also granting the enclosing directory or every file of that
+ * extension; those two follow, for the user who does want them. Every other
  * virtual tool produces nothing, so only "allow once" and "deny" are offered.
  */
-export function candidatePatterns(
+function candidates(
   virtualTool: string,
   inputs: readonly DecisionInput[],
-): readonly string[] {
-  const out: string[] = [];
-  const push = (pattern: string | undefined): void => {
-    if (pattern !== undefined && !out.includes(pattern)) out.push(pattern);
+): readonly Candidate[] {
+  const out: Candidate[] = [];
+  const push = (candidate: Candidate | undefined): void => {
+    if (candidate === undefined) return;
+    if (!out.some((existing) => existing.pattern === candidate.pattern)) out.push(candidate);
   };
 
   if (virtualTool === "terminal") {
-    for (const input of inputs) push(commandPattern(input.value));
+    for (const input of inputs) push(commandCandidate(input.value));
     return out;
   }
 
@@ -145,14 +197,38 @@ export function candidatePatterns(
   for (const input of inputs) {
     const value = input.value;
     if (value === "") continue;
+    push({
+      pattern: `^${escapePattern(value)}$`,
+      covers: `only ${renderText(value)}`,
+    });
     const parent = path.posix.dirname(value);
     if (parent !== "." && parent !== "/" && parent !== "") {
-      push(`^${escapePattern(parent)}/`);
+      push({
+        pattern: `^${escapePattern(parent)}/`,
+        covers: `${renderText(parent)}/ and everything under it`,
+      });
     }
     const extension = path.posix.extname(value);
-    if (extension.length > 1) push(`${escapePattern(extension)}$`);
+    if (extension.length > 1) {
+      push({
+        pattern: `${escapePattern(extension)}$`,
+        covers: `every file with the ${renderText(extension)} extension, anywhere`,
+      });
+    }
   }
   return out;
+}
+
+/**
+ * The patterns of {@link candidates}, in the same order. Part of the module's
+ * public contract: the caller that records a choice needs the pattern text only,
+ * and the pattern set is asserted directly by the tests.
+ */
+export function candidatePatterns(
+  virtualTool: string,
+  inputs: readonly DecisionInput[],
+): readonly string[] {
+  return candidates(virtualTool, inputs).map((candidate) => candidate.pattern);
 }
 
 /** One-line description of what decided the outcome. */
@@ -163,6 +239,10 @@ export function describeCause(decision: Decision): string {
       return `${cause.list ?? "rule"} ${describeCondition(cause)} from ${cause.origin ?? "config"} configuration`;
     case "escape":
       return "symlink escape out of the project root (cannot be disabled by configuration)";
+    case "protected":
+      return "the target is omp-toolgate's own configuration (cannot be disabled by configuration)";
+    case "unparseable":
+      return "the command could not be split, so the rules could not see what it would run (cannot be disabled by configuration)";
     case "invalid-pattern":
       return "a pattern in the configuration failed to compile";
     case "default":
@@ -175,7 +255,9 @@ export function describeCause(decision: Decision): string {
  * rule has no pattern, so printing `//` would hide what actually matched.
  */
 function describeCondition(cause: DecisionCause): string {
-  const pattern = cause.pattern ?? "";
+  // The pattern text comes from a configuration file a repository may ship, so
+  // it is untrusted like any tool argument.
+  const pattern = renderText(cause.pattern ?? "");
   const scope = cause.scope;
   if (pattern === "") {
     return scope === undefined ? "rule" : `scope ${scope}`;
@@ -189,12 +271,18 @@ function describeCondition(cause: DecisionCause): string {
  * Builds the dialog.
  *
  * "Always allow" is offered only when it can actually change the next outcome.
- * It cannot when a symlink escape forced the confirmation (design D8), and it
- * cannot when an `always_confirm` / `always_deny` rule matched: `always_allow`
- * is evaluated *after* both of those, so recording a pattern that the matching
- * rule also covers would be dead weight and the very same prompt would come
- * back. The project choice is withheld additionally when the pattern is
- * absolute, since a project file must stay portable.
+ * It cannot when a symlink escape forced the confirmation (design D8); it cannot
+ * when the target is the gate's own configuration, since recording a pattern for
+ * the file that holds the rules would let the next call rewrite them unprompted;
+ * and it cannot when an `always_confirm` / `always_deny` rule matched, because
+ * `always_allow` is evaluated after both, so a recorded pattern the matching rule
+ * also covers would be dead weight and the very same prompt would come back. The
+ * project choice is withheld additionally when the pattern is absolute, since a
+ * project file must stay portable.
+ *
+ * The body is one `\n`-joined string, so every model-supplied part of it goes
+ * through `renderText`; otherwise an argument carrying a newline would append
+ * lines the user reads as the gate's own.
  */
 export function planApproval(
   decision: Decision,
@@ -203,16 +291,16 @@ export function planApproval(
   const escaped = decision.cause.kind === "escape" || decision.inputs.some((i) => i.escaped);
   const notes: string[] = [];
   const lines = [
-    `omp-toolgate: confirm ${decision.virtualTool}`,
+    `omp-toolgate: confirm ${renderText(decision.virtualTool)}`,
     `  reason: ${describeCause(decision)}`,
   ];
 
   for (const input of decision.inputs) {
     const scope = input.scope === undefined ? "" : ` [${input.scope}]`;
-    lines.push(`  target: ${input.value}${scope}`);
+    lines.push(`  target: ${renderText(input.value)}${scope}`);
     if (input.escaped && input.literal !== undefined && input.resolved !== undefined) {
-      lines.push(`    literal:  ${input.literal}`);
-      lines.push(`    realpath: ${input.resolved}`);
+      lines.push(`    literal:  ${renderText(input.literal)}`);
+      lines.push(`    realpath: ${renderText(input.resolved)}`);
     }
   }
 
@@ -224,7 +312,17 @@ export function planApproval(
     decision.cause.kind === "rule" &&
     (decision.cause.list === "always_confirm" || decision.cause.list === "always_deny");
 
-  if (escaped) {
+  if (decision.cause.kind === "protected") {
+    notes.push(
+      "This call modifies omp-toolgate's own configuration, so it can only be allowed once: " +
+        "a recorded pattern would let the next call rewrite the rules without asking.",
+    );
+  } else if (decision.cause.kind === "unparseable") {
+    notes.push(
+      "The command could not be split into sub-commands, so no recorded pattern can be " +
+        "matched against what it would really run; it can only be allowed once.",
+    );
+  } else if (escaped) {
     notes.push(
       "This call leaves the project root through a symlink, so it can only be allowed once.",
     );
@@ -236,37 +334,42 @@ export function planApproval(
         `${describeCondition(decision.cause)}.`,
     );
   } else {
-    const candidates = candidatePatterns(decision.virtualTool, decision.inputs);
-    if (candidates.length === 0) {
+    const offers = candidates(decision.virtualTool, decision.inputs);
+    if (offers.length === 0) {
       notes.push(
-        `No safe pattern can be derived for ${decision.virtualTool}, so it can only be allowed once.`,
+        `No safe pattern can be derived for ${renderText(decision.virtualTool)}, so it can only be allowed once.`,
       );
     }
 
     // Project first: the narrower scope is the one a user should reach for by
-    // default, so it sits closer to "allow once".
-    for (const pattern of candidates) {
-      if (pattern.startsWith("^/")) continue;
+    // default, so it sits closer to "allow once". Within each scope the offers
+    // stay in candidate order, narrowest first, and every label carries its
+    // reach so a one-file approval is never confused with a subtree one.
+    for (const offer of offers) {
+      if (!paths.projectTrusted) continue;
+      if (offer.pattern.startsWith("^/")) continue;
       choices.push({
-        label: `Always allow (this project): ${pattern}`,
+        label: `Always allow (this project): ${renderText(offer.pattern)} — covers ${offer.covers}`,
         kind: "project",
-        pattern,
+        pattern: offer.pattern,
         file: paths.projectPath,
       });
     }
 
-    for (const pattern of candidates) {
+    for (const offer of offers) {
       choices.push({
-        label: `Always allow (global): ${pattern}`,
+        label: `Always allow (global): ${renderText(offer.pattern)} — covers ${offer.covers}`,
         kind: "global",
-        pattern,
+        pattern: offer.pattern,
         file: paths.globalPath,
       });
     }
 
-    if (candidates.length > 0 && !choices.some((choice) => choice.kind === "project")) {
+    if (offers.length > 0 && !choices.some((choice) => choice.kind === "project")) {
       notes.push(
-        "The target is outside the project root, so it cannot be recorded in the project configuration.",
+        paths.projectTrusted
+          ? "The target is outside the project root, so it cannot be recorded in the project configuration."
+          : `This project is not listed in the global file's trustedProjects, so an always_allow rule in ${paths.projectPath} would be discarded on load. Record it globally instead, or add the project to trustedProjects.`,
       );
     }
   }
@@ -275,19 +378,24 @@ export function planApproval(
   return { body: lines.join("\n"), choices, notes };
 }
 
-/** Why a call was blocked, phrased so the model can choose its next step. */
+/**
+ * Why a call was blocked, phrased so the model can choose its next step. Like
+ * the dialog body this is read as gate output, so model-supplied parts of it are
+ * rendered rather than interpolated raw.
+ */
 export function buildBlockReason(
   decision: Decision,
   kind: "deny" | "user-denied" | "no-ui",
   configPath: string,
 ): string {
-  const targets = decision.inputs.map((i) => i.value).join(", ") || "(no input)";
+  const targets = decision.inputs.map((i) => renderText(i.value)).join(", ") || "(no input)";
+  const tool = renderText(decision.virtualTool);
   const head =
     kind === "deny"
-      ? `omp-toolgate denied ${decision.virtualTool}`
+      ? `omp-toolgate denied ${tool}`
       : kind === "user-denied"
-        ? `omp-toolgate asked the user to confirm ${decision.virtualTool} and the user denied it`
-        : `omp-toolgate requires confirmation for ${decision.virtualTool}, and this session has no interactive UI`;
+        ? `omp-toolgate asked the user to confirm ${tool} and the user denied it`
+        : `omp-toolgate requires confirmation for ${tool}, and this session has no interactive UI`;
   const tail =
     kind === "no-ui"
       ? " Approval must happen in the parent interactive session; do not retry here."
@@ -331,9 +439,21 @@ export function appendAlwaysAllow(
   let mode: number | undefined;
   try {
     text = readFileSync(filePath, "utf8");
+    // Same guarded step as the read: if the file vanishes in between, the stat
+    // fails too and both halves are discarded together, so a deleted file is
+    // never resurrected from stale text under default permissions.
     mode = statSync(filePath).mode & 0o777;
-  } catch {
+  } catch (error) {
+    // Only a path that cannot exist means "create it". EACCES, EISDIR or a lost
+    // race are read failures, and a file we cannot read is a file we must not
+    // overwrite — same contract as the unparseable branch below.
+    const code = isRecord(error) ? error["code"] : undefined;
+    if (code !== "ENOENT" && code !== "ENOTDIR") {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`cannot record the pattern: ${filePath} could not be read (${detail})`);
+    }
     text = undefined;
+    mode = undefined;
   }
 
   let document: unknown = {};

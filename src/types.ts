@@ -110,6 +110,40 @@ export interface ToolPermissions {
   readonly default: ToolPermissionMode;
   /** Keyed by canonical virtual tool name (see `canonicalizeToolName`). */
   readonly tools: Readonly<Record<string, ToolRules>>;
+  /**
+   * Absolute paths whose modification is floored at `confirm` no matter what the
+   * rules say — the gate's own configuration files. Without this an in-project
+   * write under `write_file.default: allow` could rewrite the rules that were
+   * about to gate it.
+   */
+  readonly protectedPaths: readonly string[];
+}
+
+/**
+ * Virtual tools that modify the filesystem. Used for the protected-path floor,
+ * which must not fire on a mere read of a configuration file.
+ */
+export const MUTATING_VIRTUAL_TOOLS: Readonly<Record<string, true>> = {
+  write_file: true,
+  edit_file: true,
+  delete_path: true,
+  move_path: true,
+  copy_path: true,
+  create_directory: true,
+};
+
+/**
+ * A shell command broken into the pieces that must each be checked.
+ *
+ * `redirects` are the targets of redirections to real files, kept apart from
+ * `commands` so that a path rule can be applied to them as well: a rule on
+ * `write_file` should govern `printf x >> ~/.ssh/authorized_keys` just as it
+ * governs a `write` call. `terminal` still sees them, so an `always_allow` on a
+ * command name alone cannot approve a redirect into an unrelated file.
+ */
+export interface SplitCommand {
+  readonly commands: readonly string[];
+  readonly redirects: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -126,11 +160,25 @@ export interface NormalizedPath {
   readonly scope: PathScope;
   /** Literal path is inside `project_root` but `realpath` leaves it. */
   readonly escaped: boolean;
-  /** Absolute literal path, before symlink resolution. */
+  /**
+   * Absolute literal path: the argument made absolute against the canonicalized
+   * working directory, with `.` and `..` collapsed textually, no symlink
+   * resolution.
+   */
   readonly literal: string;
-  /** Absolute path after resolving the deepest existing ancestor. */
+  /**
+   * Absolute path after resolving symlinks component by component, left to
+   * right, so a `..` applies to the directory a symlink actually points at
+   * rather than to the name that preceded it. This is the file the tool will
+   * open, and the string `path` is derived from.
+   */
   readonly resolved: string;
-  /** Selector text stripped from the raw argument, without the leading `:`. */
+  /**
+   * Selector text stripped from the raw argument, without the leading `:`.
+   * `undefined` when nothing was stripped — which is the case for any colon
+   * whose tail does not match a known selector grammar, because a path is more
+   * likely to contain a literal colon than an unrecognized selector.
+   */
   readonly selector: string | undefined;
 }
 
@@ -160,8 +208,18 @@ export interface DecisionInput {
 
 /** Why a decision came out the way it did. */
 export interface DecisionCause {
-  /** `default` when no rule matched; `escape` for symlink promotion. */
-  readonly kind: "invalid-pattern" | "escape" | "rule" | "default";
+  /**
+   * `default` when no rule matched, `escape` for symlink promotion, `protected`
+   * when the target is one of the gate's own configuration files, `unparseable`
+   * when a command's real text could not be determined.
+   */
+  readonly kind:
+    | "invalid-pattern"
+    | "escape"
+    | "protected"
+    | "unparseable"
+    | "rule"
+    | "default";
   /**
    * The matching rule's pattern text, when `kind` is `rule`. Empty for a
    * scope-only rule, whose `scope` is then the whole condition.

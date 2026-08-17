@@ -5,8 +5,9 @@
  * under `<project_root>/.omp/`. The project file may be committed to a
  * repository, so it is treated as third-party input: unless the global file
  * lists the project root in `trustedProjects`, a project file can only tighten
- * the global rules (design D6), and the patterns it contributes are capped in
- * count and length.
+ * the global rules (design D6) — its `always_allow` is discarded outright,
+ * since that list is evaluated ahead of every `default` — and the patterns it
+ * contributes are capped in count and length.
  *
  * The module is free of global state and of `Bun.*`; JSONC parsing is injected
  * so the caller decides which parser to use.
@@ -17,6 +18,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { canonicalizeToolName } from "./mapping.ts";
+import { canonicalizePath } from "./project-root.ts";
 import { isRecord, MODE_STRICTNESS } from "./types.ts";
 import type {
   CompiledRule,
@@ -147,6 +149,9 @@ export function loadPermissions(
 
   const trusted = isTrustedProject(projectRoot, globalFile.config?.raw.trustedProjects);
   if (projectFile.config !== undefined && !trusted) {
+    // Discarded first: an allow rule that will not survive must not spend the
+    // per-tool budget that the project's tightening rules need.
+    discardProjectAllowRules(projectFile.config.tools, projectPath, warnings);
     applyProjectLimits(projectFile.config.tools, projectPath, warnings);
   }
 
@@ -177,7 +182,15 @@ export function loadPermissions(
   }
 
   return {
-    permissions: { default: topDefault, tools: Object.fromEntries(tools) },
+    permissions: {
+      default: topDefault,
+      tools: Object.fromEntries(tools),
+      // Both paths, whether or not the file exists: the file an agent would
+      // create to unlock itself is exactly the one that is missing today.
+      // Canonicalized, because `src/decision.ts` compares these against a
+      // NormalizedPath, whose own coordinates are canonical.
+      protectedPaths: [canonicalizePath(globalPath), canonicalizePath(projectPath)],
+    },
     warnings,
     globalPath,
     projectPath,
@@ -509,8 +522,37 @@ function globToRegExp(glob: string): RegExp {
 }
 
 // ---------------------------------------------------------------------------
-// Untrusted project limits
+// Untrusted project restrictions
 // ---------------------------------------------------------------------------
+
+/**
+ * Drops an untrusted project's `always_allow` before it can reach the merge.
+ *
+ * Unioning it was never safe: the decision stage evaluates `always_allow` ahead
+ * of the tool and global `default`, which is where most protection is
+ * expressed, so one committed rule would switch the gate off for that tool. A
+ * tightening-only file has no legitimate allow rule, so this is a removal
+ * rather than a re-ranking — reported per tool so it is not silent.
+ */
+function discardProjectAllowRules(
+  tools: Map<string, SideToolRules>,
+  file: string,
+  warnings: string[],
+): void {
+  for (const [name, entry] of tools) {
+    const discarded = entry.always_allow;
+    if (discarded === undefined) continue;
+    entry.always_allow = undefined;
+    if (discarded.length === 0) continue;
+    warnings.push(
+      fileWarning(
+        file,
+        `discarded ${discarded.length} "always_allow" rule(s) for "${name}": an untrusted ` +
+          `project may only tighten the global rules, and "always_allow" outranks every default`,
+      ),
+    );
+  }
+}
 
 /**
  * Caps what an untrusted project file contributes to one virtual tool, since
@@ -649,6 +691,9 @@ function mergeTools(
  * An untrusted project appends; a trusted one replaces a list it mentions and
  * leaves the global one alone otherwise. Invalid patterns follow their list, so
  * a trusted replacement also clears the global list's compile failures.
+ *
+ * An untrusted `always_allow` never arrives here — `discardProjectAllowRules`
+ * emptied it — so appending can only tighten.
  */
 function mergeList(
   globalList: CompiledList | undefined,
