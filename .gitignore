@@ -1,0 +1,15 @@
+# Vendored reference sources, read-only. Version is encoded in the directory name.
+examples/
+
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# Local rasen run state and throwaway probes.
+.rasen/
+
+# Agent tooling installed into this checkout, not project content: rasen mirrors
+# the same workflow skills into both directories on every install.
+.claude/
+.omp/

@@ -1,0 +1,22 @@
+{
+  "name": "omp-toolgate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Regex-based tool permission gate for omp. Ports the decision semantics of Zed's agent.tool_permissions and adds a project_root boundary.",
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "json5": "^2.2.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  }
+}
