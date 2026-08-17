@@ -102,12 +102,14 @@ omp-toolgate's own extension: `inside`, `outside`, or `any` (the default). A rul
 
 1. A pattern that failed to compile — that virtual tool denies **every** call.
 2. A symlink escape (see below) raises `allow` to `confirm`; it cannot be configured away.
-3. `always_deny` — any input matching denies immediately.
-4. `always_confirm` — any input matching prompts.
-5. `always_allow` — **every** input must match. `ls && rm -rf build` is not allowed by
+3. A write to one of omp-toolgate's own configuration files raises `allow` to `confirm`; it
+   cannot be configured away either, so the gate cannot be told to stop guarding its rules.
+4. `always_deny` — any input matching denies immediately.
+5. `always_confirm` — any input matching prompts.
+6. `always_allow` — **every** input must match. `ls && rm -rf build` is not allowed by
    `^ls` alone. This asymmetry is deliberate and comes from Zed.
-6. The virtual tool's `default`.
-7. The global `default`.
+7. The virtual tool's `default`.
+8. The global `default`.
 
 When one real call maps to several virtual tools — one `edit` payload can edit, delete and
 move at once — every virtual tool is decided separately and the strictest result wins
@@ -125,11 +127,17 @@ hijack the root of a monorepo.
 
 Every path argument is normalized before any pattern sees it:
 
-1. omp selectors are stripped (`app.zip:inner/x`, `db.sqlite:users:42`, `main.ts:50-200`).
-2. `~` is expanded, the path is made absolute against the working directory, and `.` / `..`
-   are collapsed — so `../../../.ssh/id_rsa` cannot dodge a `.ssh` rule.
-3. The deepest existing ancestor is resolved with `realpath` and the remainder re-joined,
-   so a path whose parents do not exist yet still works.
+1. An omp selector is stripped **only when the tail really is one**: a range or mode
+   (`main.ts:50-200`, `:raw`, `:5-16,960-973`), an archive member when the prefix ends in an
+   archive suffix (`app.zip:inner/x`), or a SQLite table/row when the prefix ends in a
+   database suffix (`db.sqlite:users:42`). Anything else keeps the colon: omp writes such a
+   path as an ordinary file, so `backup-12:30:45.tar` must be judged whole.
+2. `~` is expanded and the path is made absolute against the working directory, which is
+   itself canonicalized first so that both sides of every later comparison agree.
+3. Symlinks are resolved **component by component, left to right**, so a `..` applies to the
+   directory a symlink actually points at rather than to the name in front of it — the
+   kernel's order, not the string's. Once a component does not exist the remainder is joined
+   literally, so a path whose parents do not exist yet still works.
 4. Inside `project_root` the result is project-relative with no `./` prefix; outside it
    stays absolute. Separators are always `/`.
 
@@ -148,9 +156,12 @@ prompt shows both the literal path and its target. A repository that ships
 `<project_root>/.omp/tool-permissions.json` is usually committed, which makes it
 third-party input. So by default it is merged in the tightening direction only:
 
-- `always_deny` / `always_confirm` / `always_allow` are unions — global rules cannot be
-  removed. (Unioning `always_allow` is safe because `deny` and `confirm` are evaluated
-  first.)
+- `always_deny` and `always_confirm` are unions — global rules cannot be removed.
+- An untrusted project's `always_allow` is **discarded**, with a warning naming the tool and
+  the count. It cannot be unioned in: `always_allow` is evaluated before the `default`, so
+  one project-side allow rule would otherwise lift a global `default` of `confirm` or `deny`
+  to `allow` — which is where most protection actually lives. A tightening-only file has no
+  legitimate use for an allow rule.
 - `default`, both global and per tool, takes the stricter of the two values.
 - `tools` keys are unioned.
 
@@ -215,12 +226,21 @@ omp-toolgate: confirm write_file
   target: src/generated/api.ts [inside]
 
   > Allow once
-    Always allow (this project): ^src/generated/
-    Always allow (this project): \.ts$
-    Always allow (global): ^src/generated/
-    Always allow (global): \.ts$
+    Always allow (this project): ^src/generated/api\.ts$ — covers only src/generated/api.ts
+    Always allow (this project): ^src/generated/ — covers src/generated/ and everything under it
+    Always allow (this project): \.ts$ — covers every file with the .ts extension, anywhere
+    Always allow (global): ^src/generated/api\.ts$ — covers only src/generated/api.ts
+    Always allow (global): ^src/generated/ — covers src/generated/ and everything under it
+    Always allow (global): \.ts$ — covers every file with the .ts extension, anywhere
     Deny
 ```
+
+The exact path comes first, and every label states what the pattern widens to, because the
+directory and extension candidates are much broader than the call being approved — one click
+on `\.ts$` would permanently allow writes to every TypeScript file on the machine.
+
+Every model-supplied string in the dialog is escaped and truncated, so a tool argument
+containing newlines cannot forge extra lines below the real ones.
 
 "Always allow" appends the chosen pattern to that file's `always_allow`, creating the file
 and its directory if needed, then reloads the configuration so the pattern is live for the
@@ -248,12 +268,17 @@ omp-toolgate: confirm write_file
 The other suppressions are explained in the prompt too, rather than silently dropped:
 
 - a symlink escape offers only "allow once" and "deny";
+- so does a write to omp-toolgate's own configuration file, since recording a pattern in the
+  file that holds the rules would be self-defeating;
 - a target with no derivable pattern (`eval`, `fetch`, an MCP tool) offers only those two;
 - "always allow (this project)" disappears when the pattern is absolute, since a project
   file must stay portable;
 - a command executed by path (`./deploy.sh`, `/usr/local/bin/x`) or prefixed by an
   assignment (`PAGER=x git log`) yields no pattern at all — by design, so "always allow"
-  can never be attached to an arbitrary script.
+  can never be attached to an arbitrary script;
+- a command whose text the shell would rewrite before running it (`$'…'`, `${x-…}`,
+  `${x:0:2}`) makes the split fail, which disables `always_allow` and falls through to the
+  default — the gate refuses to guess what such a command will actually run.
 
 **Anything that is not one of the offered choices — cancel, a closed dialog — counts as a
 denial.** In a session without an interactive UI (`omp -p`, a subagent, a print-mode run) a
@@ -280,9 +305,11 @@ carrying them is not meant to be moved back into Zed.
 
 ## Known limits
 
-- **`xd://lsp` targets are unknown.** `rename`, `rename_file` and `code_actions` return a
-  workspace edit whose files cannot be determined from the arguments, so only
-  `edit_file.default` applies. Out of scope: this belongs in omp itself.
+- **`xd://lsp` targets are unknown.** `rename`, `rename_file`, `code_actions` and a raw
+  `request` can all carry a workspace edit whose files cannot be determined from the
+  arguments, so they are gated on `edit_file.default` alone. `diagnostics` is deliberately
+  **not** gated: the language server compiles the project whether or not that call passes
+  through the gate, so gating it would be theatre rather than protection.
 - **`eval` and `xd://browser` get `default` only.** Matching command patterns against
   arbitrary Python/JavaScript produces mostly false positives (`\brm\b` hits any identifier
   containing `rm`), so these map to their own virtual tools with no inputs. Tool calls made
@@ -299,13 +326,24 @@ carrying them is not meant to be moved back into Zed.
   repositories you actually trust.
 - **Write-back reformats the file.** Recording an "always allow" pattern re-serializes the
   whole document as JSON, so comments and hand formatting in that file are lost. Keep
-  hand-written notes in the file you do not write back to, or re-add them after. For the
-  same reason, symlinking `~/.omp/agent/tool-permissions.json` at your Zed `settings.json`
-  works for reading but will rewrite Zed's file on the first "always allow (global)".
+  hand-written notes in the file you do not write back to, or re-add them after. Do **not**
+  symlink `~/.omp/agent/tool-permissions.json` at your Zed `settings.json`: the first
+  "always allow (global)" would rewrite Zed's settings as plain JSON.
+- **Write-back is atomic but not locked.** Two sessions approving an "always allow" for the
+  same file at the same time can lose one of the two patterns. The file is never left
+  truncated; it can just be missing the older of two simultaneous additions.
+- **A tightened configuration is picked up on the next reload, not immediately.** The gate
+  reloads when the working directory changes and after a write-back, so editing a
+  configuration file mid-session takes effect on the next session or the next reload.
+- **Path comparison is exact.** The inside/outside test compares byte-for-byte, so on a
+  case-insensitive filesystem `/Repo/x` counts as outside `/repo`, and an NFD spelling of an
+  NFC directory name counts as a different path. Write rules with the spelling your
+  filesystem reports.
+- **A repository can turn the gate on.** An unparseable `<project_root>/.omp/tool-permissions.json`
+  still counts as "a configuration file exists", so a user with no global configuration gets
+  `default: confirm` everywhere and, in a non-interactive session, every call fails closed.
+  That is the safe direction, but it means a repository can make your `omp -p` runs stop.
 - **POSIX paths only.** Windows is not supported.
-- **A path containing a literal `:`** is cut at the first colon, because that is omp's
-  selector syntax. The result is a shorter path, which matches fewer rules than the full
-  one would, so check such paths by hand if you rely on a rule for them.
 
 ## Development
 
