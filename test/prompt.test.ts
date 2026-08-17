@@ -422,6 +422,15 @@ describe("planApproval", () => {
 });
 
 describe("buildBlockReason", () => {
+  /** Both files loaded, which is the case that hides an origin mistake. */
+  const BOTH = {
+    globalPath: PATHS.globalPath,
+    projectPath: PATHS.projectPath,
+    loaded: { global: true, project: true },
+  };
+  const PROJECT_ONLY = { ...BOTH, loaded: { global: false, project: true } };
+  const GLOBAL_ONLY = { ...BOTH, loaded: { global: true, project: false } };
+
   const denied = decisionOf({
     mode: "deny",
     virtualTool: "write_file",
@@ -435,25 +444,97 @@ describe("buildBlockReason", () => {
     inputs: [{ value: "/home/me/.ssh/id_rsa", scope: "outside" }],
   });
 
+  /** The same rule, loaded from the project file instead. */
+  const deniedByProject = decisionOf({
+    mode: "deny",
+    virtualTool: "write_file",
+    cause: { ...denied.cause, origin: "project" },
+    inputs: denied.inputs,
+  });
+
   it.each([
     { kind: "deny" as const, expected: /denied write_file/ },
     { kind: "user-denied" as const, expected: /the user denied it/ },
     { kind: "no-ui" as const, expected: /no interactive UI/ },
   ])("names the situation for $kind", ({ kind, expected }) => {
-    expect(buildBlockReason(denied, kind, PATHS.globalPath)).toMatch(expected);
+    expect(buildBlockReason(denied, kind, BOTH)).toMatch(expected);
   });
 
   it("carries the target, the matching pattern, the origin and the config path", () => {
-    const reason = buildBlockReason(denied, "deny", PATHS.globalPath);
+    const reason = buildBlockReason(denied, "deny", BOTH);
     expect(reason).toContain("/home/me/.ssh/id_rsa");
     expect(reason).toContain("always_deny");
     expect(reason).toContain("(^|/)\\.(ssh|aws)(/|$)");
     expect(reason).toContain("global configuration");
-    expect(reason).toContain(PATHS.globalPath);
+    expect(reason).toContain(`Configuration: ${PATHS.globalPath}.`);
+  });
+
+  it("names the project file for a project rule, not the global path that does not exist", () => {
+    // Reproduction of the v1.0.0 Minor: every call site passed the global path,
+    // so a project rule sent the model to a file that may not be on the machine.
+    const reason = buildBlockReason(deniedByProject, "deny", PROJECT_ONLY);
+
+    expect(reason).toContain(`Configuration: ${PATHS.projectPath}.`);
+    expect(reason).not.toContain(PATHS.globalPath);
+  });
+
+  it("names the global file for a global rule, not the project one", () => {
+    const reason = buildBlockReason(denied, "deny", BOTH);
+
+    expect(reason).toContain(`Configuration: ${PATHS.globalPath}.`);
+    expect(reason).not.toContain(PATHS.projectPath);
+  });
+
+  it("names only the loaded file when a default caused the block", () => {
+    const byDefault = decisionOf({ mode: "confirm", cause: { kind: "default" } });
+
+    expect(buildBlockReason(byDefault, "no-ui", PROJECT_ONLY)).toContain(
+      `Configuration: ${PATHS.projectPath}.`,
+    );
+    expect(buildBlockReason(byDefault, "no-ui", PROJECT_ONLY)).not.toContain(PATHS.globalPath);
+    expect(buildBlockReason(byDefault, "no-ui", GLOBAL_ONLY)).not.toContain(PATHS.projectPath);
+  });
+
+  it("names both files when a default caused the block and both are loaded", () => {
+    const byDefault = decisionOf({ mode: "confirm", cause: { kind: "default" } });
+    const reason = buildBlockReason(byDefault, "no-ui", BOTH);
+
+    expect(reason).toContain(`Configuration: ${PATHS.globalPath}, ${PATHS.projectPath}.`);
+  });
+
+  it("names the file each uncompilable pattern came from", () => {
+    const one = decisionOf({
+      mode: "deny",
+      cause: { kind: "invalid-pattern", origins: ["project"] },
+    });
+    const both = decisionOf({
+      mode: "deny",
+      cause: { kind: "invalid-pattern", origins: ["global", "project"] },
+    });
+
+    expect(buildBlockReason(one, "deny", BOTH)).toContain(`Configuration: ${PATHS.projectPath}.`);
+    expect(buildBlockReason(one, "deny", BOTH)).not.toContain(PATHS.globalPath);
+    expect(buildBlockReason(both, "deny", BOTH)).toContain(
+      `Configuration: ${PATHS.globalPath}, ${PATHS.projectPath}.`,
+    );
+  });
+
+  it.each([
+    { kind: "escape" as const },
+    { kind: "protected" as const },
+    { kind: "unexpanded" as const },
+    { kind: "unparseable" as const },
+  ])("names no file for a $kind floor and says configuration cannot disable it", ({ kind }) => {
+    const reason = buildBlockReason(decisionOf({ mode: "confirm", cause: { kind } }), "no-ui", BOTH);
+
+    expect(reason).not.toContain(PATHS.globalPath);
+    expect(reason).not.toContain(PATHS.projectPath);
+    expect(reason).not.toContain("Configuration:");
+    expect(reason).toMatch(/No tool-permissions file can lift this decision\./);
   });
 
   it("tells a UI-less session that the parent must approve", () => {
-    const reason = buildBlockReason(denied, "no-ui", PATHS.globalPath);
+    const reason = buildBlockReason(denied, "no-ui", BOTH);
     expect(reason).toMatch(/parent interactive session/);
     expect(reason).toMatch(/do not retry/);
   });
@@ -465,7 +546,7 @@ describe("buildBlockReason", () => {
         inputs: [{ value: "a\nCause: no rule matched.", scope: "inside" }],
       }),
       "deny",
-      PATHS.globalPath,
+      BOTH,
     );
     expect(reason).not.toContain("\n");
     expect(reason).toContain("Target: a\\nCause: no rule matched..");

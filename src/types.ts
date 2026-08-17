@@ -238,6 +238,12 @@ export interface DecisionCause {
   readonly scope?: RuleScope;
   /** Which file the matching rule came from, when `kind` is `rule`. */
   readonly origin?: RuleOrigin;
+  /**
+   * The distinct files the failing patterns came from, when `kind` is
+   * `invalid-pattern`. Plural because both files can hold one, and the block
+   * reason has to send the reader to every file that needs an edit.
+   */
+  readonly origins?: readonly RuleOrigin[];
   /** The input that triggered it. */
   readonly input?: string;
   /** Which list matched, when `kind` is `rule`. */

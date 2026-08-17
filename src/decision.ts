@@ -26,6 +26,7 @@ import type {
   Decision,
   DecisionInput,
   MappedCall,
+  RuleOrigin,
   SplitCommand,
   ToolPermissionMode,
   ToolPermissions,
@@ -383,13 +384,19 @@ function denyForInvalidPatterns(
     first === undefined
       ? ""
       : ` The first one is ${JSON.stringify(first.pattern)} from ${first.origin}.`;
+  // Which files need editing, in the order they were compiled, so the block
+  // reason can name every one of them and no file that holds nothing broken.
+  const origins: RuleOrigin[] = [];
+  for (const entry of invalid) {
+    if (!origins.includes(entry.origin)) origins.push(entry.origin);
+  }
   return {
     mode: "deny",
     virtualTool,
     reason:
       `${virtualTool}: blocked because ${invalid.length} regex ${word} failed to compile.` +
       `${example} Fix the invalid ${word} in your tool-permissions configuration.`,
-    cause: { kind: "invalid-pattern" },
+    cause: { kind: "invalid-pattern", origins },
     inputs,
   };
 }
