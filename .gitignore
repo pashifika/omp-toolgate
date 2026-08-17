@@ -6,6 +6,11 @@ dist/
 *.log
 .DS_Store
 
+# Bun's lockfile is derived: `bun install` migrates package-lock.json, and CI
+# reruns that migration on a clean runner. Committing a second lockfile would
+# only add a second thing to keep honest.
+bun.lock
+
 # Local rasen run state and throwaway probes.
 .rasen/
 
