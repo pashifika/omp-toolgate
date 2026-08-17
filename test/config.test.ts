@@ -14,6 +14,7 @@ import {
 } from "../src/config.ts";
 import type { LoadedPermissions } from "../src/config.ts";
 import { decide } from "../src/decision.ts";
+import { EMITTED_VIRTUAL_TOOLS } from "../src/mapping.ts";
 import { MODE_STRICTNESS } from "../src/types.ts";
 import type { DecisionInput, ToolPermissionMode, ToolRules } from "../src/types.ts";
 
@@ -380,6 +381,65 @@ describe("accepted shapes", () => {
     const tools = loaded.permissions?.tools;
     expect(Object.getPrototypeOf(tools)).toBe(Object.prototype);
     expect(tools?.["always_deny"]).toBeUndefined();
+  });
+});
+
+describe("tool keys nothing maps to", () => {
+  /** The wording is the contract: it says nothing maps to the name, not that it is invalid. */
+  const UNMAPPABLE = /no omp call maps to/;
+
+  it.each([{ key: "create_directory" }, { key: "copy_path" }, { key: "invent_file" }])(
+    "reports $key, which only the protected-path floor ever uses",
+    ({ key }) => {
+      const loaded = loadFixture(`unmappable-${key}`, {
+        global: { tools: { [key]: { always_deny: ["\\.env$"] } } },
+      });
+
+      const warning = warningMatching(loaded, UNMAPPABLE);
+      expect(warning).toContain(`"tools.${key}"`);
+      expect(warning).not.toMatch(/invalid/);
+    },
+  );
+
+  it("keeps applying the rules of the tools that do exist", () => {
+    const loaded = loadFixture("unmappable-alongside", {
+      global: {
+        default: "allow",
+        tools: {
+          create_directory: { always_deny: ["\\.env$"] },
+          write_file: { always_confirm: ["\\.env$"] },
+        },
+      },
+    });
+
+    expect(warningMatching(loaded, UNMAPPABLE)).toContain("create_directory");
+    expect(modeFor(loaded, { value: ".env", scope: "inside" })).toBe("confirm");
+  });
+
+  it("says nothing about an MCP key, whose server and tool names are the user's", () => {
+    const loaded = loadFixture("unmappable-mcp", {
+      global: { tools: { "mcp:context7:query-docs": { default: "confirm" } } },
+    });
+
+    expect(loaded.warnings.filter((warning) => UNMAPPABLE.test(warning))).toEqual([]);
+  });
+
+  it("says nothing about an MCP key written in omp's own mcp__server__tool form", () => {
+    const loaded = loadFixture("unmappable-mcp-raw", {
+      global: { tools: { mcp__context7__query_docs: { default: "confirm" } } },
+    });
+
+    expect(loaded.warnings.filter((warning) => UNMAPPABLE.test(warning))).toEqual([]);
+  });
+
+  it("says nothing about any name the mapping can emit", () => {
+    const tools = Object.fromEntries(
+      Object.keys(EMITTED_VIRTUAL_TOOLS).map((name) => [name, { default: "confirm" }] as const),
+    );
+    const loaded = loadFixture("unmappable-none", { global: { default: "allow", tools } });
+
+    expect(loaded.warnings).toEqual([]);
+    expect(Object.keys(EMITTED_VIRTUAL_TOOLS).length).toBe(15);
   });
 });
 
