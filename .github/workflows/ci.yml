@@ -98,7 +98,12 @@ jobs:
               | {
                   readonly tools: Record<
                     string,
-                    { readonly invalidPatterns: readonly { readonly pattern: string }[] }
+                    {
+                      readonly always_allow: readonly unknown[];
+                      readonly always_confirm: readonly unknown[];
+                      readonly always_deny: readonly unknown[];
+                      readonly invalidPatterns: readonly { readonly pattern: string }[];
+                    }
                   >;
                 }
               | undefined;
@@ -171,18 +176,34 @@ jobs:
           // A document the loader can read but that declares nothing yields an empty
           // permission set with no warning — deliberate, since it keeps an empty
           // configuration writable, and indistinguishable here from a policy that was
-          // replaced by something inert. The published baseline is not empty.
+          // replaced by something inert. So substance is asked for twice: at least one
+          // tool, and at least one compiled rule across all of them. A tool may
+          // legitimately carry only a `default` — the sample's `computer` does — so the
+          // rule count is taken over the whole policy rather than per tool.
           const tools = Object.keys(permissions.tools);
           if (tools.length === 0) {
-            throw new Error(`${sample} loaded but declares no tool rules`);
+            throw new Error(`${sample} loaded but declares no tools`);
           }
-          const invalid = Object.entries(permissions.tools).flatMap(([tool, rules]) =>
-            rules.invalidPatterns.map((entry) => `${tool}: ${entry.pattern}`),
+          const rules = Object.values(permissions.tools).reduce(
+            (total, tool) =>
+              total +
+              tool.always_allow.length +
+              tool.always_confirm.length +
+              tool.always_deny.length,
+            0,
+          );
+          if (rules === 0) {
+            throw new Error(`${sample} compiled no rules for its ${tools.length} tools`);
+          }
+          const invalid = Object.entries(permissions.tools).flatMap(([tool, entry]) =>
+            entry.invalidPatterns.map((pattern) => `${tool}: ${pattern.pattern}`),
           );
           if (invalid.length > 0) {
             throw new Error(`${sample} holds patterns that do not compile: ${invalid.join(", ")}`);
           }
-          console.log(`ok ${sample} -> ${tools.length} tools, no warnings: ${tools.join(", ")}`);
+          console.log(
+            `ok ${sample} -> ${tools.length} tools, ${rules} rules, no warnings: ${tools.join(", ")}`,
+          );
           console.log(`installed omp-toolgate ${manifest.version} with license ${manifest.license}`);
           TS
           bun check.ts
