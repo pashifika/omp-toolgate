@@ -14,7 +14,7 @@
       "source": {
         "source": "github",
         "repo": "pashifika/omp-toolgate",
-        "ref": "chore/v1.0.0-release-prep"
+        "ref": "v1.0.0"
       },
       "category": "security",
       "homepage": "https://github.com/pashifika/omp-toolgate",
