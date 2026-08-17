@@ -180,6 +180,12 @@ export interface NormalizedPath {
    * likely to contain a literal colon than an unrecognized selector.
    */
   readonly selector: string | undefined;
+  /**
+   * The argument still contains an expansion the shell has not performed
+   * (`$HOME/x`, `${OUT}/log`), so nothing here says where it will land. Such a
+   * path is never classified `inside`, and the decision is floored at `confirm`.
+   */
+  readonly unexpanded: boolean;
 }
 
 /** Resolves a raw path argument. Injected so mapping stays filesystem-free. */
@@ -200,6 +206,8 @@ export interface DecisionInput {
   readonly scope?: PathScope;
   /** Forces at least `confirm`; cannot be disabled by configuration. */
   readonly escaped?: boolean;
+  /** The path still holds an unexpanded expansion; see `NormalizedPath`. */
+  readonly unexpanded?: boolean;
   /** Absolute literal path, for the approval prompt. */
   readonly literal?: string;
   /** Absolute resolved path, for the approval prompt. */
@@ -218,6 +226,7 @@ export interface DecisionCause {
     | "escape"
     | "protected"
     | "unparseable"
+    | "unexpanded"
     | "rule"
     | "default";
   /**

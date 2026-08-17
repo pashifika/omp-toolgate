@@ -5,8 +5,9 @@
  * under `<project_root>/.omp/`. The project file may be committed to a
  * repository, so it is treated as third-party input: unless the global file
  * lists the project root in `trustedProjects`, a project file can only tighten
- * the global rules (design D6) — its `always_allow` is discarded outright,
- * since that list is evaluated ahead of every `default` — and the patterns it
+ * the global rules (design D6) — its `always_allow` is discarded outright, and
+ * its `always_confirm` for any tool that would otherwise `deny`, since both
+ * lists are evaluated ahead of every `default` — and the patterns it
  * contributes are capped in count and length.
  *
  * The module is free of global state and of `Bun.*`; JSONC parsing is injected
@@ -15,7 +16,7 @@
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import { canonicalizeToolName } from "./mapping.ts";
 import { canonicalizePath } from "./project-root.ts";
@@ -147,17 +148,28 @@ export function loadPermissions(
     };
   }
 
-  const trusted = isTrustedProject(projectRoot, globalFile.config?.raw.trustedProjects);
+  const globalDefault = globalFile.config?.raw.default;
+  const projectDefault = projectFile.config?.raw.default;
+  // What a tool falls back on when the global file names no mode for it.
+  const globalFloor = globalDefault ?? IMPLIED_GLOBAL_DEFAULT;
+
+  const trusted = isTrustedProject(projectRoot, globalFile.config?.raw.trustedProjects, {
+    file: globalPath,
+    warnings,
+  });
   if (projectFile.config !== undefined && !trusted) {
-    // Discarded first: an allow rule that will not survive must not spend the
-    // per-tool budget that the project's tightening rules need.
-    discardProjectAllowRules(projectFile.config.tools, projectPath, warnings);
+    // Discarded first: a rule that will not survive must not spend the per-tool
+    // budget that the project's tightening rules need.
+    discardProjectRelaxations(
+      projectFile.config.tools,
+      globalFile.config?.tools,
+      globalFloor,
+      projectPath,
+      warnings,
+    );
     applyProjectLimits(projectFile.config.tools, projectPath, warnings);
   }
 
-  const globalDefault = globalFile.config?.raw.default;
-  const projectDefault = projectFile.config?.raw.default;
-  const globalFloor = globalDefault ?? IMPLIED_GLOBAL_DEFAULT;
   const topDefault = trusted
     ? (projectDefault ?? globalFloor)
     : projectDefault === undefined
@@ -497,20 +509,52 @@ const GLOB_TOKEN = /\*\*|[*?]|[^*?]+/g;
 const REGEXP_META = /[\\^$.*+?()[\]{}|]/g;
 const TRAILING_SLASHES = /(?!^)\/+$/;
 
-function isTrustedProject(projectRoot: string, patterns: readonly string[] | undefined): boolean {
+/**
+ * Whether the global file's `trustedProjects` names this project root.
+ *
+ * An entry must be absolute. A relative one is ignored rather than resolved,
+ * because the only thing to resolve it against is the process working
+ * directory, so `Work/*` would name a different directory in every session —
+ * and trust is the one decision that must not depend on where a session
+ * started. Every entry is examined even after a match, so a mistake in a later
+ * entry is still reported.
+ */
+function isTrustedProject(
+  projectRoot: string,
+  patterns: readonly string[] | undefined,
+  sink: Sink,
+): boolean {
   if (patterns === undefined || patterns.length === 0) return false;
   const root = resolve(projectRoot);
-  return patterns.some((pattern) => matchesProjectRoot(pattern, root));
+  let trusted = false;
+  for (const pattern of patterns) {
+    const trimmed = pattern.replace(TRAILING_SLASHES, "");
+    if (trimmed === "") continue;
+    if (!isAbsolute(trimmed)) {
+      sink.warnings.push(
+        fileWarning(
+          sink.file,
+          `ignored the relative "trustedProjects" entry ${JSON.stringify(pattern)}: an entry must ` +
+            `be an absolute path, since a relative one names a different directory in every ` +
+            `session ("~" is not expanded)`,
+        ),
+      );
+      continue;
+    }
+    if (matchesProjectRoot(trimmed, root)) trusted = true;
+  }
+  return trusted;
 }
 
 function matchesProjectRoot(pattern: string, root: string): boolean {
-  const trimmed = pattern.replace(TRAILING_SLASHES, "");
-  if (trimmed === "") return false;
-  if (!GLOB_META.test(trimmed)) return resolve(trimmed) === root;
-  return globToRegExp(trimmed).test(root);
+  if (!GLOB_META.test(pattern)) return resolve(pattern) === root;
+  return globToRegExp(pattern).test(root);
 }
 
-/** `*` stays inside one segment, `**` crosses separators, `?` is one character. */
+/**
+ * `*` stays inside one segment, `**` crosses separators — so it also reaches a
+ * repository nested inside a trusted one — and `?` is one character.
+ */
 function globToRegExp(glob: string): RegExp {
   const source = glob.replace(GLOB_TOKEN, (token) => {
     if (token === "**") return ".*";
@@ -525,33 +569,73 @@ function globToRegExp(glob: string): RegExp {
 // Untrusted project restrictions
 // ---------------------------------------------------------------------------
 
+/** Why an untrusted project's `always_allow` cannot be unioned into the merge. */
+const ALLOW_DISCARD_REASON = '"always_allow" outranks every default';
+
+/** Why the same holds for its `always_confirm` in front of a `deny`. */
+const CONFIRM_DISCARD_REASON =
+  '"always_confirm" outranks every default as well, so it would lower this tool\'s "deny" to a prompt';
+
 /**
- * Drops an untrusted project's `always_allow` before it can reach the merge.
+ * Drops the rules an untrusted project may not contribute, before they reach
+ * the merge.
  *
- * Unioning it was never safe: the decision stage evaluates `always_allow` ahead
- * of the tool and global `default`, which is where most protection is
- * expressed, so one committed rule would switch the gate off for that tool. A
- * tightening-only file has no legitimate allow rule, so this is a removal
- * rather than a re-ranking — reported per tool so it is not silent.
+ * The invariant enforced here: no call may come out of the merge weaker than
+ * the same call would be WITHOUT the project file. The decision stage ranks
+ * `always_deny` > `always_confirm` > `always_allow` > `default`, so a project
+ * list is safe exactly when it cannot beat the mode that call already had:
+ *
+ * - `always_allow` beats every `default`, so unioning it would switch the gate
+ *   off for that tool. A tightening-only file has no legitimate allow rule, so
+ *   the whole list goes.
+ * - `always_confirm` beats every `default` too, so in front of a `deny` it
+ *   lowers a refusal to a prompt. It goes for exactly the tools whose default
+ *   is `deny` without this file; against an `allow` or `confirm` baseline a
+ *   prompt is a tightening and the list stays.
+ * - `always_deny` and a stricter `default` cannot relax anything: `mergeList`
+ *   only appends and `mergeDefault` takes the stricter of the two, measured
+ *   against what the tool inherits rather than against "unset".
+ *
+ * A discarded list becomes absent rather than empty, so the global list it was
+ * going to be unioned with survives. Reported per tool so it is not silent.
  */
-function discardProjectAllowRules(
-  tools: Map<string, SideToolRules>,
+function discardProjectRelaxations(
+  projectTools: Map<string, SideToolRules>,
+  globalTools: Map<string, SideToolRules> | undefined,
+  globalFloor: ToolPermissionMode,
   file: string,
   warnings: string[],
 ): void {
-  for (const [name, entry] of tools) {
-    const discarded = entry.always_allow;
-    if (discarded === undefined) continue;
-    entry.always_allow = undefined;
-    if (discarded.length === 0) continue;
-    warnings.push(
-      fileWarning(
-        file,
-        `discarded ${discarded.length} "always_allow" rule(s) for "${name}": an untrusted ` +
-          `project may only tighten the global rules, and "always_allow" outranks every default`,
-      ),
-    );
+  const sink: Sink = { file, warnings };
+  for (const [name, entry] of projectTools) {
+    discardProjectList(entry, "always_allow", name, ALLOW_DISCARD_REASON, sink);
+    // The mode this tool has without the project file: what the project's own
+    // rules must not be able to undercut.
+    const baseline = globalTools?.get(name)?.default ?? globalFloor;
+    if (baseline === "deny") {
+      discardProjectList(entry, "always_confirm", name, CONFIRM_DISCARD_REASON, sink);
+    }
   }
+}
+
+function discardProjectList(
+  entry: SideToolRules,
+  list: "always_allow" | "always_confirm",
+  name: string,
+  reason: string,
+  sink: Sink,
+): void {
+  const discarded = entry[list];
+  if (discarded === undefined) return;
+  entry[list] = undefined;
+  if (discarded.length === 0) return;
+  sink.warnings.push(
+    fileWarning(
+      sink.file,
+      `discarded ${discarded.length} "${list}" rule(s) for "${name}": an untrusted project may ` +
+        `only tighten the global rules, and ${reason}`,
+    ),
+  );
 }
 
 /**
@@ -692,8 +776,9 @@ function mergeTools(
  * leaves the global one alone otherwise. Invalid patterns follow their list, so
  * a trusted replacement also clears the global list's compile failures.
  *
- * An untrusted `always_allow` never arrives here — `discardProjectAllowRules`
- * emptied it — so appending can only tighten.
+ * An untrusted `always_allow` never arrives here, and neither does an
+ * `always_confirm` in front of a `deny` default — `discardProjectRelaxations`
+ * cleared them — so appending can only tighten.
  */
 function mergeList(
   globalList: CompiledList | undefined,

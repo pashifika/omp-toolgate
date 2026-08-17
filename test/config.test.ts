@@ -13,7 +13,9 @@ import {
   PROJECT_PATTERN_LIMIT,
 } from "../src/config.ts";
 import type { LoadedPermissions } from "../src/config.ts";
-import type { ToolRules } from "../src/types.ts";
+import { decide } from "../src/decision.ts";
+import { MODE_STRICTNESS } from "../src/types.ts";
+import type { DecisionInput, ToolPermissionMode, ToolRules } from "../src/types.ts";
 
 /**
  * One real directory tree for the whole file, with one workspace per case.
@@ -67,6 +69,15 @@ function writeConfig(file: string, content: Content): void {
   writeFileSync(file, typeof content === "string" ? content : JSON.stringify(content, undefined, 2));
 }
 
+/** Writes one side of a fixture, or removes that file when the side is absent. */
+function writeSide(file: string, content: Content | undefined): void {
+  if (content === undefined) {
+    rmSync(file, { force: true });
+    return;
+  }
+  writeConfig(file, content);
+}
+
 function load(workspace: Workspace): LoadedPermissions {
   return loadPermissions(workspace.projectRoot, workspace.env, JSON5.parse);
 }
@@ -85,6 +96,16 @@ function rulesFor(loaded: LoadedPermissions, tool: string): ToolRules {
     throw new Error(`expected rules for "${tool}", found ${found}`);
   }
   return rules;
+}
+
+/**
+ * The mode one input gets for `write_file` under a loaded configuration, or
+ * `allow` when no configuration file exists at all — the gate standing aside.
+ */
+function modeFor(loaded: LoadedPermissions, input: DecisionInput): ToolPermissionMode {
+  const permissions = loaded.permissions;
+  if (permissions === undefined) return "allow";
+  return decide("write_file", [input], permissions).mode;
 }
 
 function warningMatching(loaded: LoadedPermissions, needle: RegExp): string {
@@ -689,6 +710,189 @@ describe("merging an untrusted project", () => {
     expect(rulesFor(loaded, "write_file").default).toBe("confirm");
     expect(rulesFor(loaded, "write_file").always_allow).toEqual([]);
   });
+
+  it("discards the project's always_confirm for a tool that would otherwise deny", () => {
+    // Reproduction B3: `always_confirm` outranks the `default` exactly as
+    // `always_allow` does, so one committed rule lowered a global
+    // `write_file.default: "deny"` to a prompt.
+    const workspace = createWorkspace("confirm-vs-tool-deny", {
+      global: { default: "confirm", tools: { write_file: { default: "deny" } } },
+      project: { tools: { write_file: { always_confirm: [{ scope: "any" }] } } },
+    });
+
+    const loaded = load(workspace);
+
+    expect(loaded.trusted).toBe(false);
+    expect(rulesFor(loaded, "write_file").default).toBe("deny");
+    expect(rulesFor(loaded, "write_file").always_confirm).toEqual([]);
+    expect(modeFor(loaded, { value: ".env", scope: "inside" })).toBe("deny");
+    // Reported in the same shape as the `always_allow` discard.
+    expect(loaded.warnings).toEqual([
+      `${workspace.projectPath}: discarded 1 "always_confirm" rule(s) for "write_file": an untrusted project may only tighten the global rules, and "always_confirm" outranks every default as well, so it would lower this tool's "deny" to a prompt`,
+    ]);
+  });
+
+  it("discards the project's always_confirm when the tool denies by inheritance", () => {
+    // The same relaxation one level up: the tool has no `default` of its own,
+    // so the `deny` it would be refused by is the global one.
+    const loaded = loadFixture("confirm-vs-global-deny", {
+      global: { default: "deny" },
+      project: { tools: { write_file: { always_confirm: ["\\.env$"] } } },
+    });
+
+    expect(rulesFor(loaded, "write_file").always_confirm).toEqual([]);
+    expect(modeFor(loaded, { value: ".env", scope: "inside" })).toBe("deny");
+  });
+
+  it("keeps a project always_confirm that tightens an allow default", () => {
+    // The legitimate half of the same list, which the discard must not take
+    // away: a prompt in front of `allow` is a tightening.
+    const loaded = loadFixture("confirm-tightens-allow", {
+      global: { default: "allow" },
+      project: { tools: { write_file: { always_confirm: ["\\.env$"] } } },
+    });
+
+    expect(loaded.warnings).toEqual([]);
+    expect(rulesFor(loaded, "write_file").always_confirm.map((rule) => rule.source)).toEqual([
+      "\\.env$",
+    ]);
+    expect(modeFor(loaded, { value: ".env", scope: "inside" })).toBe("confirm");
+    expect(modeFor(loaded, { value: "src/app.ts", scope: "inside" })).toBe("allow");
+  });
+
+  it("keeps the global always_confirm and the project's always_deny while discarding the rest", () => {
+    const loaded = loadFixture("confirm-discard-scope", {
+      global: { tools: { write_file: { default: "deny", always_confirm: ["^dist/"] } } },
+      project: {
+        tools: { write_file: { always_confirm: ["\\.env$"], always_deny: ["^secret/"] } },
+      },
+    });
+
+    const rules = rulesFor(loaded, "write_file");
+    expect(rules.always_confirm.map((rule) => rule.source)).toEqual(["^dist/"]);
+    expect(rules.always_deny.map((rule) => rule.source)).toEqual(["^secret/"]);
+    expect(modeFor(loaded, { value: "dist/app.js", scope: "inside" })).toBe("confirm");
+    expect(modeFor(loaded, { value: ".env", scope: "inside" })).toBe("deny");
+  });
+
+  it("stays quiet when the project mentions always_confirm without a rule", () => {
+    const loaded = loadFixture("confirm-empty", {
+      global: { default: "deny", tools: { write_file: { always_confirm: ["^dist/"] } } },
+      project: { tools: { write_file: { always_confirm: [] } } },
+    });
+
+    expect(loaded.warnings).toEqual([]);
+    expect(rulesFor(loaded, "write_file").always_confirm.map((rule) => rule.source)).toEqual([
+      "^dist/",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The trust boundary as one invariant
+// ---------------------------------------------------------------------------
+
+const MODES_OR_ABSENT: readonly (ToolPermissionMode | undefined)[] = [
+  undefined,
+  "allow",
+  "confirm",
+  "deny",
+];
+
+/** The global rule lists the invariant is measured against. */
+const globalRuleSets: readonly Record<string, unknown>[] = [
+  {},
+  { always_allow: [{ scope: "any" }] },
+  { always_confirm: ["^dist/"] },
+  { always_deny: ["\\.env$"] },
+];
+
+/** One global file: an optional top default, `write_file` default and rule list. */
+function globalSide(
+  topDefault: ToolPermissionMode | undefined,
+  toolDefault: ToolPermissionMode | undefined,
+  lists: Record<string, unknown>,
+): Record<string, unknown> {
+  const tool: Record<string, unknown> = { ...lists };
+  if (toolDefault !== undefined) tool["default"] = toolDefault;
+  const side: Record<string, unknown> = {};
+  if (topDefault !== undefined) side["default"] = topDefault;
+  if (Object.keys(tool).length > 0) side["tools"] = { write_file: tool };
+  return side;
+}
+
+/** Every top default, tool default and rule list, plus no global file at all. */
+const globalSides: readonly (Record<string, unknown> | undefined)[] = [
+  undefined,
+  ...MODES_OR_ABSENT.flatMap((topDefault) =>
+    MODES_OR_ABSENT.flatMap((toolDefault) =>
+      globalRuleSets.map((lists) => globalSide(topDefault, toolDefault, lists)),
+    ),
+  ),
+];
+
+/** Every shape a committed project file could use to try to weaken a call. */
+const projectShapes: readonly {
+  readonly label: string;
+  readonly rules: Record<string, unknown>;
+}[] = [
+  { label: "always_confirm on any scope", rules: { always_confirm: [{ scope: "any" }] } },
+  { label: "always_confirm on a pattern", rules: { always_confirm: ["\\.env$"] } },
+  { label: "always_allow on any scope", rules: { always_allow: [{ scope: "any" }] } },
+  { label: "always_deny on any scope", rules: { always_deny: [{ scope: "any" }] } },
+  {
+    label: "always_confirm next to a relaxed tool default",
+    rules: { default: "allow", always_confirm: [{ scope: "any" }] },
+  },
+  {
+    label: "always_confirm next to a tightened tool default",
+    rules: { default: "deny", always_confirm: [{ scope: "any" }] },
+  },
+  {
+    label: "all three lists at once",
+    rules: {
+      always_allow: [{ scope: "any" }],
+      always_confirm: [{ scope: "any" }],
+      always_deny: ["^secret/"],
+    },
+  },
+];
+
+describe("an untrusted project can never weaken an outcome", () => {
+  /** Neither probe is a configuration file, so no decision floor takes part. */
+  const probes: readonly DecisionInput[] = [
+    { value: ".env", scope: "inside" },
+    { value: "src/app.ts", scope: "inside" },
+  ];
+
+  it.each(projectShapes)(
+    "holds for every global side against a project with $label",
+    ({ rules }) => {
+      const workspace = createWorkspace("invariant", {});
+      for (const globalContent of globalSides) {
+        for (const projectDefault of MODES_OR_ABSENT) {
+          const projectContent: Record<string, unknown> = { tools: { write_file: rules } };
+          if (projectDefault !== undefined) projectContent["default"] = projectDefault;
+          writeSide(workspace.globalPath, globalContent);
+          writeSide(workspace.projectPath, projectContent);
+          const merged = load(workspace);
+          writeSide(workspace.projectPath, undefined);
+          const baseline = load(workspace);
+
+          expect(merged.trusted).toBe(false);
+          for (const probe of probes) {
+            const before = modeFor(baseline, probe);
+            const after = modeFor(merged, probe);
+            expect(
+              MODE_STRICTNESS[after],
+              `global ${JSON.stringify(globalContent)} + project ${JSON.stringify(projectContent)}` +
+                ` on ${probe.value}: ${before} without the project file, ${after} with it`,
+            ).toBeGreaterThanOrEqual(MODE_STRICTNESS[before]);
+          }
+        }
+      }
+    },
+  );
 });
 
 describe("trustedProjects", () => {
@@ -784,6 +988,58 @@ describe("trustedProjects", () => {
     expect(rulesFor(loaded, "write_file").always_confirm.map((rule) => rule.source)).toEqual([
       "\\.env$",
     ]);
+  });
+
+  it.each([{ entry: "work/repo" }, { entry: "work/*" }, { entry: "~/work/repo" }])(
+    "ignores the relative trustedProjects entry $entry and reports it",
+    ({ entry }) => {
+      // The only thing to resolve a relative entry against is the process
+      // working directory, so it would name a different project in every
+      // session; `~` is not expanded either.
+      const workspace = createWorkspace("trust-relative", { project: { default: "allow" } });
+      writeConfig(workspace.globalPath, { trustedProjects: [entry], default: "confirm" });
+
+      const loaded = load(workspace);
+
+      expect(loaded.trusted).toBe(false);
+      expect(loaded.permissions?.default).toBe("confirm");
+      const warning = warningMatching(loaded, /trustedProjects/);
+      expect(warning).toContain(workspace.globalPath);
+      expect(warning).toContain(JSON.stringify(entry));
+    },
+  );
+
+  it("reports a relative entry even when a later entry matches", () => {
+    const workspace = createWorkspace("trust-mixed", { project: { default: "allow" } });
+    writeConfig(workspace.globalPath, {
+      trustedProjects: ["work/repo", workspace.projectRoot],
+      default: "confirm",
+    });
+
+    const loaded = load(workspace);
+
+    expect(loaded.trusted).toBe(true);
+    expect(loaded.permissions?.default).toBe("allow");
+    expect(warningMatching(loaded, /trustedProjects/)).toContain('"work/repo"');
+  });
+
+  it("reaches a nested repository through ** but not through *", () => {
+    // Documented, because it is what a `~/Work/**` entry costs: a vendored
+    // checkout or submodule under a trusted tree is trusted as well.
+    const workspace = createWorkspace("trust-nested", {});
+    const nested = join(workspace.projectRoot, "vendor", "third-party");
+    writeConfig(join(nested, ".omp", "tool-permissions.json"), { default: "allow" });
+    const parent = dirname(workspace.projectRoot);
+
+    writeConfig(workspace.globalPath, { trustedProjects: [`${parent}/**`], default: "confirm" });
+    const crossing = loadPermissions(nested, workspace.env, JSON5.parse);
+    writeConfig(workspace.globalPath, { trustedProjects: [`${parent}/*`], default: "confirm" });
+    const single = loadPermissions(nested, workspace.env, JSON5.parse);
+
+    expect(crossing.trusted).toBe(true);
+    expect(crossing.permissions?.default).toBe("allow");
+    expect(single.trusted).toBe(false);
+    expect(single.permissions?.default).toBe("confirm");
   });
 });
 

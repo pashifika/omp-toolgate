@@ -14,9 +14,12 @@
  * because this extension never shadows it (design D1). Zed's blanket rejection
  * of commands containing `$VAR` / `$(...)` / backticks is a non-goal because
  * omp's `bash` runs under a PTY and uses shell expansion daily; sub-command
- * extraction below covers the injection vector that rejection was guarding.
+ * extraction below covers the injection vector that rejection was guarding, and
+ * an expansion is refused only where it stands in the command-name position and
+ * so hides which program runs.
  */
 
+import { basename } from "node:path";
 import { MODE_STRICTNESS, MUTATING_VIRTUAL_TOOLS } from "./types.ts";
 import type {
   CompiledRule,
@@ -44,6 +47,39 @@ const MAX_NESTING_DEPTH = 32;
  */
 const PLAIN_PARAMETER = /^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+)$/;
 
+/**
+ * A leading `NAME=value` word, which sets a variable for the command that
+ * follows instead of naming a program itself.
+ */
+const ASSIGNMENT_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * Reserved words that introduce a command rather than being one, so the program
+ * that runs is named by the word after them. In the command-name position bash
+ * always reads these as keywords, so treating them as prefixes is what the
+ * shell does, not a guess.
+ */
+const COMMAND_INTRODUCERS: Readonly<Record<string, true>> = {
+  "!": true,
+  "{": true,
+  do: true,
+  elif: true,
+  else: true,
+  if: true,
+  then: true,
+  time: true,
+  until: true,
+  while: true,
+};
+
+/**
+ * Characters that make a bare `$` an expansion: a parameter name, a positional
+ * number, or one of the special parameters. Deliberately generous — a `$` that
+ * expands to nothing costs one prompt, a `$` mistaken for a literal costs the
+ * whole judgement.
+ */
+const EXPANDS_AFTER_DOLLAR = /[A-Za-z0-9_@*#?!$-]/;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -70,15 +106,17 @@ export function decide(
 
   if (rules === undefined) {
     return escapeFloor(
-      protectedFloor(
-        {
-          mode: permissions.default,
-          virtualTool,
-          reason: `${virtualTool}: no rules configured, so the global default (${permissions.default}) applies.`,
-          cause: { kind: "default" },
-          inputs,
-        },
-        permissions.protectedPaths,
+      unexpandedFloor(
+        protectedFloor(
+          {
+            mode: permissions.default,
+            virtualTool,
+            reason: `${virtualTool}: no rules configured, so the global default (${permissions.default}) applies.`,
+            cause: { kind: "default" },
+            inputs,
+          },
+          permissions.protectedPaths,
+        ),
       ),
     );
   }
@@ -107,12 +145,14 @@ export function decide(
   }
 
   return escapeFloor(
-    protectedFloor(
-      unparseableFloor(
-        checkInputs(virtualTool, evaluated, rules, splitFailure, permissions.default),
-        splitFailure,
+    unexpandedFloor(
+      protectedFloor(
+        unparseableFloor(
+          checkInputs(virtualTool, evaluated, rules, splitFailure, permissions.default),
+          splitFailure,
+        ),
+        permissions.protectedPaths,
       ),
-      permissions.protectedPaths,
     ),
   );
 }
@@ -178,6 +218,14 @@ export function matchesRule(rule: CompiledRule, input: DecisionInput): boolean {
  * their own sub-commands. An expansion whose result cannot be known from the
  * text — `$'\x72\x6d'`, `${x-rm}` — is refused outright rather than emitted as
  * a literal that no rule would match.
+ *
+ * Position decides what an expansion costs. In an argument it leaves the
+ * program readable, so `echo ${HOME}` and `awk '{print $1}'` split as written.
+ * In the command-name position it *is* the program, and `x=r; y=m; $x$y -rf ~`
+ * splits into three sub-commands that contain no `rm` at all, so a first word
+ * carrying an expansion is refused like an unparseable command. A leading
+ * `NAME=value` assignment or a reserved word (`if`, `time`, …) introduces the
+ * command rather than being it, so the word after it is the one judged.
  *
  * `redirects` holds the write targets (`>`, `>>`, `>|`, `&>`, `<>`), bare and
  * unquoted, so that `write_file` rules can be applied to them too. A read
@@ -347,14 +395,16 @@ function denyForInvalidPatterns(
 }
 
 /**
- * Raises `allow` to `confirm` when the command could not be split.
+ * Raises `allow` to `confirm` when the command could not be read.
  *
  * Disabling `always_allow` is not enough on its own: with a `default` of `allow`
  * — which the README's own recommended shape uses for `terminal`, protecting
- * itself with `always_confirm` patterns — an unparseable command would sail past
+ * itself with `always_confirm` patterns — an unreadable command would sail past
  * the pattern lists that were never able to see what it really runs. `$'\x72\x6d'`
- * expands to `rm` in the shell and matches no `\brm\b` rule as written, so the
- * only honest answer is to ask.
+ * expands to `rm` in the shell and matches no `\brm\b` rule as written, and
+ * `$x$y` in the command-name position hides the program entirely, so the only
+ * honest answer is to ask. `splitFailure` says which of the two it was, and the
+ * prompt shows it.
  */
 function unparseableFloor(decision: Decision, splitFailure: string | undefined): Decision {
   if (splitFailure === undefined || decision.mode !== "allow") return decision;
@@ -366,6 +416,30 @@ function unparseableFloor(decision: Decision, splitFailure: string | undefined):
       `sub-commands (${splitFailure}), so the rules could not be matched against what the shell ` +
       `would actually run. This cannot be disabled by configuration.`,
     cause: { kind: "unparseable" },
+    inputs: decision.inputs,
+  };
+}
+
+/**
+ * Raises `allow` to `confirm` when a path argument still carries an expansion the
+ * shell has not performed.
+ *
+ * It runs before {@link escapeFloor} because such a path is reported as an escape
+ * too — the literal spelling sits inside the project while nothing says where the
+ * expansion lands — and "through a symlink" would be the wrong explanation.
+ */
+function unexpandedFloor(decision: Decision): Decision {
+  if (decision.mode !== "allow") return decision;
+  const pending = decision.inputs.find((input) => input.unexpanded === true);
+  if (pending === undefined) return decision;
+  return {
+    mode: "confirm",
+    virtualTool: decision.virtualTool,
+    reason:
+      `${decision.virtualTool}: confirmation required because ${JSON.stringify(pending.value)} still ` +
+      `contains an expansion the shell has not performed, so where it lands is not knowable here. ` +
+      `This cannot be disabled by configuration.`,
+    cause: { kind: "unexpanded", input: pending.value },
     inputs: decision.inputs,
   };
 }
@@ -392,13 +466,24 @@ function escapeFloor(decision: Decision): Decision {
   };
 }
 
+/** An input that reached a protected configuration file, and how it got there. */
+interface ProtectedHit {
+  readonly input: DecisionInput;
+  /**
+   * The protected file the input reached, or its bare name when only that
+   * matched — two configuration files share one name, so a relative mention
+   * cannot honestly be attributed to either.
+   */
+  readonly path: string;
+  /** A path `is` the file; a shell command only `mentions` it. */
+  readonly verb: "is" | "mentions";
+}
+
 /**
- * Raises `allow` to `confirm` when a mutating tool targets one of the gate's own
+ * Raises `allow` to `confirm` when a call reaches one of the gate's own
  * configuration files. Without it a single `write_file.default: allow` lets the
  * agent rewrite the rules that were about to gate it, and the rewrite goes live
- * on the next reload. Both the literal and the resolved path are compared: the
- * literal catches the file named directly, the resolved one catches a symlink
- * pointing at it.
+ * on the next reload.
  *
  * Like `escapeFloor` it only ever raises `allow`, so the two compose in either
  * order and either one firing is enough. Callers run this one first, so that a
@@ -406,25 +491,68 @@ function escapeFloor(decision: Decision): Decision {
  * a generic escape.
  */
 function protectedFloor(decision: Decision, protectedPaths: readonly string[]): Decision {
-  if (decision.mode !== "allow" || MUTATING_VIRTUAL_TOOLS[decision.virtualTool] !== true) {
-    return decision;
-  }
-  const hit = decision.inputs.find(
-    (input) =>
-      protectedPaths.includes(input.resolved ?? "") || protectedPaths.includes(input.literal ?? ""),
-  );
+  if (decision.mode !== "allow") return decision;
+  const hit = findProtected(decision.virtualTool, decision.inputs, protectedPaths);
   if (hit === undefined) return decision;
 
   return {
     mode: "confirm",
     virtualTool: decision.virtualTool,
     reason:
-      `${decision.virtualTool}: confirmation required because ${JSON.stringify(hit.value)} is this ` +
-      `gate's own tool-permissions configuration (${hit.resolved ?? hit.literal}). This cannot be ` +
+      `${decision.virtualTool}: confirmation required because ${JSON.stringify(hit.input.value)} ` +
+      `${hit.verb} this gate's own tool-permissions configuration (${hit.path}). This cannot be ` +
       `disabled by configuration.`,
-    cause: { kind: "protected", input: hit.value },
+    cause: { kind: "protected", input: hit.input.value },
     inputs: decision.inputs,
   };
+}
+
+/**
+ * Finds the first input that reaches a protected file.
+ *
+ * A path tool names the file it will open, so an exact match on the literal or
+ * the resolved path is both necessary and enough: the literal catches the file
+ * named directly, the resolved one catches a symlink pointing at it.
+ *
+ * A shell command is text. The redirection targets handed to `write_file` cover
+ * only the writes the shell itself performs, and `cp evil.json <config>` or
+ * `sed -i '' … <config>` opens the file on its own. Nothing in the command has
+ * been resolved to a path, so every mention of a protected file, or of its name
+ * alone, is treated as reaching it. That asks on a command that merely says
+ * `tool-permissions.json`, which is the cheap direction to be wrong in.
+ */
+function findProtected(
+  virtualTool: string,
+  inputs: readonly DecisionInput[],
+  protectedPaths: readonly string[],
+): ProtectedHit | undefined {
+  if (virtualTool === TERMINAL_TOOL) {
+    // A whole path names one file and is reported as such. A bare file name is
+    // only remembered, so that a command spelling out one configuration file is
+    // never reported as the other.
+    let byName: ProtectedHit | undefined;
+    for (const input of inputs) {
+      for (const path of protectedPaths) {
+        if (input.value.includes(path)) return { input, path, verb: "mentions" };
+        const name = basename(path);
+        if (byName === undefined && input.value.includes(name)) {
+          byName = { input, path: name, verb: "mentions" };
+        }
+      }
+    }
+    return byName;
+  }
+
+  if (MUTATING_VIRTUAL_TOOLS[virtualTool] !== true) return undefined;
+  for (const input of inputs) {
+    if (
+      protectedPaths.includes(input.resolved ?? "") ||
+      protectedPaths.includes(input.literal ?? "")
+    ) {
+      return { input, path: input.resolved ?? input.literal ?? "", verb: "is" };
+    }
+  }
+  return undefined;
 }
 
 function describeRule(rule: CompiledRule): string {
@@ -473,6 +601,12 @@ interface WordRead {
   readonly text: string;
   /** Source slice, needed to tell an unquoted `2` file descriptor from `'2'`. */
   readonly raw: string;
+  /**
+   * Whether the shell will substitute something into this word before running
+   * it: `$name`, `${name}`, `$(…)` or a backquote. Harmless in an argument,
+   * disqualifying in the command-name position.
+   */
+  readonly expansion: boolean;
   readonly next: number;
 }
 
@@ -499,6 +633,12 @@ function collectCommands(text: string, parse: Parse, depth: number): boolean {
   let reads: string[] = [];
   let writes: string[] = [];
   let nested: string[] = [];
+  /**
+   * Whether the program this segment runs is still to be read. An assignment
+   * prefix or a reserved word introduces a command instead of being one, so
+   * both leave it pending.
+   */
+  let awaitingName = true;
 
   /**
    * Ends the current segment. `binaryBefore` / `binaryAfter` say whether the
@@ -523,6 +663,7 @@ function collectCommands(text: string, parse: Parse, depth: number): boolean {
     reads = [];
     writes = [];
     nested = [];
+    awaitingName = true;
     return true;
   };
 
@@ -614,6 +755,25 @@ function collectCommands(text: string, parse: Parse, depth: number): boolean {
       i = redirect.next;
       continue;
     }
+    // The command name is the one word every rule is really about, so an
+    // expansion there is not a value the shell will substitute into a readable
+    // command — it *is* the command. `x=r; y=m; $x$y -rf ~` splits perfectly
+    // well into three sub-commands and none of them contains `rm`, so refusing
+    // the split is the only honest answer, exactly as for `$'\x72\x6d'`. An
+    // expansion in an argument leaves the name readable and stays welcome.
+    if (
+      awaitingName &&
+      !ASSIGNMENT_PREFIX.test(word.text) &&
+      COMMAND_INTRODUCERS[word.text] !== true
+    ) {
+      if (word.expansion) {
+        parse.failure ??=
+          `the command name ${word.text} is produced by an expansion, which hides the ` +
+          `program that will run`;
+        return false;
+      }
+      awaitingName = false;
+    }
     words.push(word.text);
     i = word.next;
   }
@@ -629,6 +789,7 @@ function readWord(
   parse: Parse,
 ): WordRead | undefined {
   let value = "";
+  let expansion = false;
   let i = start;
 
   while (i < text.length) {
@@ -676,6 +837,7 @@ function readWord(
       const quotedPart = readDoubleQuoted(text, i, nested, parse);
       if (quotedPart === undefined) return undefined;
       value += quotedPart.text;
+      if (quotedPart.expansion) expansion = true;
       i = quotedPart.next;
       continue;
     }
@@ -684,6 +846,7 @@ function readWord(
       const substitution = readBackquote(text, i, nested, parse);
       if (substitution === undefined) return undefined;
       value += substitution.source;
+      expansion = true;
       i = substitution.next;
       continue;
     }
@@ -702,6 +865,7 @@ function readWord(
         const substitution = readDollarParen(text, i, nested, parse);
         if (substitution === undefined) return undefined;
         value += substitution.source;
+        expansion = true;
         i = substitution.next;
         continue;
       }
@@ -709,16 +873,21 @@ function readWord(
         const braced = readBraced(text, i, parse);
         if (braced === undefined) return undefined;
         value += braced.source;
+        expansion = true;
         i = braced.next;
         continue;
       }
+      // A bare `$name` is kept as its source text, which a rule can still read
+      // in an argument. The command-name check is what stops it from standing
+      // in for the program itself.
+      if (EXPANDS_AFTER_DOLLAR.test(next)) expansion = true;
     }
 
     value += c;
     i += 1;
   }
 
-  return { text: value, raw: text.slice(start, i), next: i };
+  return { text: value, raw: text.slice(start, i), expansion, next: i };
 }
 
 /** Reads a double-quoted section, keeping the expansions inside it visible. */
@@ -727,13 +896,14 @@ function readDoubleQuoted(
   start: number,
   nested: string[],
   parse: Parse,
-): { text: string; next: number } | undefined {
+): { text: string; expansion: boolean; next: number } | undefined {
   let value = "";
+  let expansion = false;
   let i = start + 1;
 
   while (i < text.length) {
     const c = text.charAt(i);
-    if (c === '"') return { text: value, next: i + 1 };
+    if (c === '"') return { text: value, expansion, next: i + 1 };
 
     if (c === "\\") {
       if (i + 1 >= text.length) {
@@ -756,6 +926,7 @@ function readDoubleQuoted(
       const substitution = readBackquote(text, i, nested, parse);
       if (substitution === undefined) return undefined;
       value += substitution.source;
+      expansion = true;
       i = substitution.next;
       continue;
     }
@@ -766,6 +937,7 @@ function readDoubleQuoted(
         const substitution = readDollarParen(text, i, nested, parse);
         if (substitution === undefined) return undefined;
         value += substitution.source;
+        expansion = true;
         i = substitution.next;
         continue;
       }
@@ -774,9 +946,12 @@ function readDoubleQuoted(
         const braced = readBraced(text, i, parse);
         if (braced === undefined) return undefined;
         value += braced.source;
+        expansion = true;
         i = braced.next;
         continue;
       }
+      // Double quotes do not stop a bare `$name` from expanding either.
+      if (EXPANDS_AFTER_DOLLAR.test(next)) expansion = true;
     }
 
     value += c;

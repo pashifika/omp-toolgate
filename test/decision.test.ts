@@ -453,6 +453,109 @@ describe("spec: permission-decision", () => {
     });
   });
 
+  describe("expansions in the command-name position (re-review Blocker A)", () => {
+    it("refuses the reproduction and names the command name it cannot read", () => {
+      // The splitter reads this as three perfectly ordinary sub-commands, so no
+      // earlier floor fires — and none of the three contains `rm`, which is why
+      // the README's own `\b(rm|rmdir|…)\b` guard never sees the deletion.
+      const command = "x=r; y=m; $x$y -rf ~/Documents";
+      expect(/\b(rm|rmdir)\b/i.test(command)).toBe(false);
+      expect(splitCommand(command)).toBeUndefined();
+
+      const decision = terminal(
+        command,
+        { default: "allow", confirm: ["\\b(rm|rmdir|mv|dd|mkfs|chmod|chown)\\b"] },
+        "allow",
+      );
+      expect(decision.mode).toBe("confirm");
+      expect(decision.cause.kind).toBe("unparseable");
+      expect(decision.reason).toMatch(/the command name \$x\$y is produced by an expansion/);
+      expect(decision.reason).toMatch(/cannot be disabled by configuration/);
+    });
+
+    const unreadable = [
+      { scenario: "a bare parameter", command: "$x -rf ~" },
+      { scenario: "a braced parameter glued to literal text", command: "${x}buster" },
+      { scenario: "a command substitution", command: "$(which rm) -rf ~" },
+      { scenario: "a backquote substitution", command: "`which rm` -rf ~" },
+      { scenario: "a parameter inside double quotes", command: '"$x" -rf ~' },
+      // A reserved word introduces the command, so the name is the word after it.
+      { scenario: "a parameter after a reserved word", command: "if $x -rf ~; then :; fi" },
+      // The value of an assignment becomes a command name at the point of use.
+      { scenario: "an assignment used as a command name", command: "c=rm\n$c -rf ~" },
+    ];
+
+    it.each(unreadable)("refuses $scenario in the command-name position", ({ command }) => {
+      expect(splitCommand(command)).toBeUndefined();
+      // No pattern at all, so only the floor can raise the permissive default.
+      const decision = terminal(command, { default: "allow" }, "allow");
+      expect(decision.mode).toBe("confirm");
+      expect(decision.cause.kind).toBe("unparseable");
+      expect(decision.reason).toMatch(/is produced by an expansion/);
+    });
+
+    /** A command that must still split, and a rule its command name must match. */
+    interface ArgumentCase {
+      readonly scenario: string;
+      readonly command: string;
+      readonly commands: readonly string[];
+      /** Anchored on the command name, so a match proves the name stayed readable. */
+      readonly namePattern: string;
+    }
+
+    const inArgumentPosition: readonly ArgumentCase[] = [
+      {
+        scenario: "a braced parameter as the only argument",
+        command: "echo ${HOME}",
+        commands: ["echo ${HOME}"],
+        namePattern: "^echo\\b",
+      },
+      {
+        scenario: "an awk program that looks like a parameter",
+        command: "awk '{print $1}' notes.txt",
+        commands: ["awk {print $1} notes.txt"],
+        namePattern: "^awk\\b",
+      },
+      {
+        scenario: "a quoted pattern that spells an expansion",
+        command: "grep -rn '\\$\\{' src",
+        commands: ["grep -rn \\$\\{ src"],
+        namePattern: "^grep\\b",
+      },
+      {
+        scenario: "a pipeline with a file descriptor duplication",
+        command: "cargo test 2>&1 | tail -20",
+        commands: ["cargo test", "tail -20"],
+        namePattern: "^cargo\\s+test\\b",
+      },
+    ];
+
+    it.each(inArgumentPosition)(
+      "keeps splitting $scenario",
+      ({ command, commands, namePattern }) => {
+        expect(splitCommand(command)).toEqual({ commands, redirects: [] });
+        // A deny anchored on the command name proves the rules still reach it.
+        const decision = terminal(command, { default: "allow", deny: [namePattern] }, "allow");
+        expect(decision.mode).toBe("deny");
+        expect(decision.cause.input).toBe(commands[0]);
+      },
+    );
+
+    it.each([
+      { scenario: "a literal value", command: "PAGER=x git log" },
+      { scenario: "an expanded value", command: "PAGER=$TOKEN git log" },
+    ])("judges the command after an assignment prefix with $scenario", ({ command }) => {
+      expect(splitCommand(command)).toEqual({ commands: [command], redirects: [] });
+      const decision = terminal(command, { default: "allow", deny: ["\\bgit\\s+log\\b"] }, "allow");
+      expect(decision.mode).toBe("deny");
+    });
+
+    it("separates the two positions of one and the same expansion", () => {
+      expect(terminal("echo $x", { default: "allow" }, "allow").mode).toBe("allow");
+      expect(terminal("$x echo", { default: "allow" }, "allow").mode).toBe("confirm");
+    });
+  });
+
   describe("one call across several virtual tools", () => {
     const mapped: readonly MappedCall[] = [
       { virtualTool: "edit_file", inputs: [{ value: "src/a.ts", scope: "inside" }] },
@@ -792,6 +895,63 @@ describe("spec: permission-decision", () => {
       expect(decision.mode).toBe("confirm");
       expect(decision.cause.kind).toBe("protected");
       expect(decision.cause.input).toBe(".omp/tool-permissions.json");
+    });
+
+    /**
+     * A shell command opens the file itself, so the redirect targets the
+     * mapping step derives cover nothing here: `cp` and `sed -i` never redirect.
+     */
+    const shellCases = [
+      {
+        scenario: "a command that copies over the global configuration",
+        command: `cp /tmp/evil.json ${GLOBAL_CONFIG}`,
+        expected: "confirm" as ToolPermissionMode,
+        cause: "protected" as DecisionCause["kind"],
+      },
+      {
+        scenario: "a command that edits the global configuration in place",
+        command: `sed -i '' 's/confirm/allow/' ${GLOBAL_CONFIG}`,
+        expected: "confirm" as ToolPermissionMode,
+        cause: "protected" as DecisionCause["kind"],
+      },
+      {
+        // Reached by a relative path, which is why the file name is compared too.
+        scenario: "a command that reaches the project configuration relatively",
+        command: "cp evil.json .omp/tool-permissions.json",
+        expected: "confirm" as ToolPermissionMode,
+        cause: "protected" as DecisionCause["kind"],
+      },
+      {
+        scenario: "a command that writes an ordinary file",
+        command: "printf x > notes.txt",
+        expected: "allow" as ToolPermissionMode,
+        cause: "default" as DecisionCause["kind"],
+      },
+      {
+        scenario: "an ordinary command",
+        command: "git status --porcelain",
+        expected: "allow" as ToolPermissionMode,
+        cause: "default" as DecisionCause["kind"],
+      },
+    ];
+
+    it.each(shellCases)("$scenario", ({ command, expected, cause }) => {
+      const decision = guarded("terminal", { value: command }, { default: "allow" });
+      expect(decision.mode).toBe(expected);
+      expect(decision.cause.kind).toBe(cause);
+    });
+
+    it("names the configuration file the command reached, over any always_allow", () => {
+      const decision = guarded(
+        "terminal",
+        { value: `cp /tmp/evil.json ${GLOBAL_CONFIG}` },
+        { default: "allow", allow: [".*"] },
+      );
+      expect(decision.mode).toBe("confirm");
+      expect(decision.cause.kind).toBe("protected");
+      expect(decision.reason).toMatch(/mentions this gate's own tool-permissions configuration/);
+      expect(decision.reason).toContain(GLOBAL_CONFIG);
+      expect(decision.reason).toMatch(/cannot be disabled by configuration/);
     });
   });
 });

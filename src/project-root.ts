@@ -9,7 +9,7 @@
  * POSIX paths only; Windows is an explicit non-goal.
  */
 
-import { existsSync, readlinkSync, realpathSync } from "node:fs";
+import { existsSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isRecord, type NormalizedPath, type PathResolver } from "./types.ts";
@@ -52,11 +52,32 @@ const SELECTOR_PART = `raw|conflicts|${RANGE}(?:,${RANGE})*`;
 /** A whole range/mode tail, at most two components (`raw:2-4`, `2-4:raw`). */
 const SELECTOR_TAIL = new RegExp(`^(?:${SELECTOR_PART})(?::(?:${SELECTOR_PART}))?$`);
 
+/**
+ * A tail made of nothing but line numbers, the one selector form that is also an
+ * ordinary filename: omp writes `report:2024` to that literal name.
+ */
+const BARE_NUMERIC_TAIL = /^\d+(?::\d+)?$/;
+
 /** Prefixes after which any tail, `/` included, is an archive member path. */
 const ARCHIVE_SUFFIX = /\.(?:zip|tar\.gz|tar|tgz|jar|war|ear|apk)$/i;
 
 /** Prefixes after which a `/`-free tail is a `table` or `table:key` selector. */
 const SQLITE_SUFFIX = /\.(?:sqlite3|sqlite|db3|db)$/i;
+
+/**
+ * A `$` something else still has to expand: `$HOME`, `${HOME}`, `$(pwd)`, and
+ * `$1` as well, because an unset name expands to nothing and leaves `/etc/passwd`
+ * behind.
+ */
+const PENDING_EXPANSION = /\$[\w{(]/;
+
+/**
+ * How many symlinks one resolution may follow, Linux's `SYMLOOP_MAX`. A chain
+ * longer than this stops resolving and leaves the remainder literal: refusing to
+ * answer is not an option here, and without a cap the pair `a -> b/../a` with a
+ * dangling `b` re-enters `a` forever.
+ */
+const MAX_LINK_HOPS = 40;
 
 /**
  * Resolves the project root for a session.
@@ -115,15 +136,27 @@ export interface StrippedSelector {
  * unknown tail would gate `x` while `x:/../../../.ssh/authorized_keys` is the
  * file created — and would shorten an ordinary `backup-12:30:45.tar` past every
  * rule written for it.
+ *
+ * A tail of nothing but digits is the one selector form that is also an ordinary
+ * name, so it is a selector only when `prefix` names a file that already exists:
+ * `notes.md:50` on an existing file is a line selector, while `report:2024` is a
+ * filename and omp writes it whole. A range, a list or a mode (`50-200`,
+ * `50+150`, `5-16,960-973`, `raw`, `conflicts`, `raw:2-4`) names no file and
+ * needs no such check. `base` is the directory a relative `prefix` is taken
+ * against, the process directory when it is omitted.
  */
-export function stripSelectors(raw: string): StrippedSelector {
+export function stripSelectors(
+  raw: string,
+  base?: string,
+  env?: NodeJS.ProcessEnv,
+): StrippedSelector {
   const cut = candidateColon(raw);
   if (cut < 0) {
     return { path: raw, selector: undefined };
   }
   const prefix = raw.slice(0, cut);
   const tail = raw.slice(cut + 1);
-  if (!isSelectorTail(prefix, tail)) {
+  if (!isSelectorTail(prefix, tail, base, env)) {
     return { path: raw, selector: undefined };
   }
   return { path: prefix, selector: tail };
@@ -189,6 +222,13 @@ export function canonicalizePath(target: string): string {
  *
  * `literal` keeps the textual reading of the same argument, so the two together
  * say both what was asked for and what would be opened.
+ *
+ * A `target` that still carries an unexpanded `$name`, `${…}` or `$(…)` is never
+ * `inside`: a rule written for the project cannot be assumed to cover a string
+ * the shell has not expanded yet. `> $HOME/.ssh/authorized_keys` reads as a
+ * project-relative name and writes in the home directory, so with its literal
+ * spelling inside the project it is reported as an escape — the one answer that
+ * says the gate cannot tell where this lands.
  */
 function normalizeAgainstRoot(
   raw: string,
@@ -196,11 +236,12 @@ function normalizeAgainstRoot(
   root: string,
   env: NodeJS.ProcessEnv | undefined,
 ): NormalizedPath {
-  const stripped = stripSelectors(raw);
+  const stripped = stripSelectors(raw, base, env);
   const target = expandHome(stripped.path, env);
   const literal = resolve(base, target);
   const resolved = walkComponents(target, base);
-  const inside = isWithin(resolved, root);
+  const unexpanded = PENDING_EXPANSION.test(target);
+  const inside = !unexpanded && isWithin(resolved, root);
   return {
     path: inside ? toProjectRelative(root, resolved) : resolved,
     scope: inside ? "inside" : "outside",
@@ -208,6 +249,7 @@ function normalizeAgainstRoot(
     literal,
     resolved,
     selector: stripped.selector,
+    unexpanded,
   };
 }
 
@@ -258,8 +300,16 @@ function candidateColon(raw: string): number {
  *
  * An empty tail is a trailing colon in a filename, never a selector. A tail
  * holding a `/` is one only inside an archive, where it is a member path.
+ *
+ * A tail of nothing but digits is a selector only on a file that already exists:
+ * `report:2024` is a filename, `notes.md:50` on a real file is a line range.
  */
-function isSelectorTail(prefix: string, tail: string): boolean {
+function isSelectorTail(
+  prefix: string,
+  tail: string,
+  base: string | undefined,
+  env: NodeJS.ProcessEnv | undefined,
+): boolean {
   if (tail === "") {
     return false;
   }
@@ -269,7 +319,23 @@ function isSelectorTail(prefix: string, tail: string): boolean {
   if (tail.includes("/")) {
     return false;
   }
-  return SQLITE_SUFFIX.test(prefix) || SELECTOR_TAIL.test(tail);
+  if (SQLITE_SUFFIX.test(prefix)) {
+    return true;
+  }
+  if (!SELECTOR_TAIL.test(tail)) {
+    return false;
+  }
+  if (!BARE_NUMERIC_TAIL.test(tail)) {
+    return true;
+  }
+  // A range or a mode names no file, a bare number does: the tail is a selector
+  // only on a file that is already there to be read by line. `statSync` throws
+  // for everything else, a missing name included, which is the answer.
+  try {
+    return statSync(resolve(base ?? process.cwd(), expandHome(prefix, env))).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /** Expands a leading `~` or `~/`. `~user` is a non-goal and stays literal. */
@@ -293,8 +359,11 @@ function expandHome(target: string, env: NodeJS.ProcessEnv | undefined): string 
  * through one is reported as staying inside it. Resolution stops at the first
  * component that cannot be resolved and the remainder is joined as written, so
  * a file whose parents do not exist yet still normalizes.
+ *
+ * A dangling link's own target is resolved through this same walk, `hops` deep at
+ * most, so a chain of links and the directories behind them all end up resolved.
  */
-function walkComponents(target: string, base: string): string {
+function walkComponents(target: string, base: string, hops: number = MAX_LINK_HOPS): string {
   let current = isAbsolute(target) ? sep : base;
   let resolving = true;
   for (const part of target.split("/")) {
@@ -316,36 +385,37 @@ function walkComponents(target: string, base: string): string {
       const code = isRecord(error) ? error["code"] : undefined;
       // A dangling symlink still names where a write lands: `open(…, O_CREAT)`
       // creates the link's target, not the link. `realpathSync` refuses it, so
-      // read the link and keep resolving from there.
+      // read the link and resolve its own target through this same walk: adopted
+      // as written, a directory link on the way to that target would stay
+      // unresolved and a rule written for the real file would miss it.
       const linked = code === "ENOENT" ? readLink(joined) : undefined;
-      if (linked !== undefined) {
-        current = linked;
+      if (linked !== undefined && hops > 0) {
+        current = walkComponents(linked, current, hops - 1);
         continue;
       }
       // A component that cannot exist has no symlink to follow, so the rest is
       // taken as written and a later `..` may resume in existing territory. Any
-      // other failure (EACCES, ELOOP) means the target cannot be named at all:
-      // stop resolving rather than pass a literal spelling off as canonical.
+      // other failure (EACCES, ELOOP), and a chain past `MAX_LINK_HOPS`, means
+      // the target cannot be named at all: stop resolving rather than pass a
+      // literal spelling off as canonical.
       current = joined;
-      resolving = code === "ENOENT" || code === "ENOTDIR";
+      resolving = linked === undefined && (code === "ENOENT" || code === "ENOTDIR");
     }
   }
   return current;
 }
 
 /**
- * The target of `candidate` when it is a symlink whose own target is missing,
- * resolved against the link's directory. `undefined` when `candidate` is not a
- * link at all.
+ * The literal target of `candidate` when it is a symlink, `undefined` when it is
+ * not a link at all. A relative target stays as written: the caller resolves it
+ * against the link's own directory, which is where the kernel reads it from.
  */
 function readLink(candidate: string): string | undefined {
-  let target: string;
   try {
-    target = readlinkSync(candidate);
+    return readlinkSync(candidate);
   } catch {
     return undefined;
   }
-  return isAbsolute(target) ? target : join(dirname(candidate), target);
 }
 
 /** Expresses `target` relative to `root`; the root itself becomes `""`. */

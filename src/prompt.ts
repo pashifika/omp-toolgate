@@ -243,6 +243,8 @@ export function describeCause(decision: Decision): string {
       return "the target is omp-toolgate's own configuration (cannot be disabled by configuration)";
     case "unparseable":
       return "the command could not be split, so the rules could not see what it would run (cannot be disabled by configuration)";
+    case "unexpanded":
+      return "the target still contains an expansion the shell has not performed, so where it lands is unknown (cannot be disabled by configuration)";
     case "invalid-pattern":
       return "a pattern in the configuration failed to compile";
     case "default":
@@ -321,6 +323,11 @@ export function planApproval(
     notes.push(
       "The command could not be split into sub-commands, so no recorded pattern can be " +
         "matched against what it would really run; it can only be allowed once.",
+    );
+  } else if (decision.cause.kind === "unexpanded") {
+    notes.push(
+      "The target still contains an expansion the shell has not performed, so no recorded " +
+        "pattern can describe where it will land; it can only be allowed once.",
     );
   } else if (escaped) {
     notes.push(

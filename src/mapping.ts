@@ -192,11 +192,74 @@ const DEBUG_COMMAND_ARGS: Readonly<Record<string, string>> = {
 };
 
 /**
- * Where `manage_skill` writes. omp's default agent directory is `~/.omp/agent`
- * and this module cannot read the session's actual one, so the path is
- * best-effort; the `write_file` / `delete_path` rules still apply to it.
+ * `xd://debug` actions that set a breakpoint carrying an expression the adapter
+ * evaluates on every hit. `condition` and `hit_condition` are that expression,
+ * and it runs in the debuggee's own evaluator: debugpy evaluates Python there,
+ * so `__import__("os").system(...)` runs without a further tool call. Removing
+ * a breakpoint evaluates nothing, so only the `set_` actions are here.
  */
-const MANAGED_SKILLS_ROOT = "~/.omp/agent/managed-skills";
+const DEBUG_EXPRESSION_ACTIONS: Readonly<Record<string, true>> = {
+  set_breakpoint: true,
+  set_instruction_breakpoint: true,
+  set_data_breakpoint: true,
+};
+
+/** The breakpoint arguments those actions hand to the adapter's evaluator. */
+const DEBUG_EXPRESSION_ARGS = ["condition", "hit_condition"];
+
+/** The `xd://debug` action that overwrites the memory of a running process. */
+const DEBUG_WRITE_MEMORY = "write_memory";
+
+/**
+ * Internal URI schemes a `write` cannot reach a resource through, and why each
+ * one is ungated. omp's registry is `agent`, `artifact`, `history`, `issue`,
+ * `local`, `mcp`, `memory`, `omp`, `pr`, `rule`, `security`, `skill`, `ssh`,
+ * `vault` and `xd` (`omp://tools/read.md`). Of those, only a handler with a
+ * `write` hook writes anything: `ssh://host/<path>` writes a remote file and
+ * `vault://` writes a secret, so neither is here. `local://` is this session's
+ * own artifact sandbox, `conflict://` replaces a marker region inside a file the
+ * model has already read rather than a path this argument names, `xd://` is a
+ * device dispatch handled before this table, and everything else listed is
+ * read-only, so omp refuses the write before it touches anything. `http://` and
+ * `https://` are refused for the same reason.
+ *
+ * A scheme absent from this table — one an MCP server advertises, or one omp
+ * adds later — is treated as a write, because this mapping cannot know that it
+ * is not one.
+ */
+const UNWRITABLE_SCHEMES: Readonly<Record<string, true>> = {
+  agent: true,
+  artifact: true,
+  conflict: true,
+  history: true,
+  http: true,
+  https: true,
+  issue: true,
+  local: true,
+  mcp: true,
+  memory: true,
+  omp: true,
+  pr: true,
+  rule: true,
+  security: true,
+  skill: true,
+};
+
+/**
+ * Environment variable that relocates omp's agent directory. `src/config.ts`
+ * reads the same one: the managed skills a `manage_skill` or `learn` call writes
+ * live under whichever directory it names.
+ */
+const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
+
+/**
+ * omp's default agent directory, in `~` form so the injected resolver expands
+ * it rather than this module reading `HOME` behind the resolver's back.
+ */
+const DEFAULT_AGENT_DIR = "~/.omp/agent";
+
+/** The shell's own name for a working directory, so a rule can match on it. */
+const CWD_NAME = "PWD";
 
 /** omp's general-purpose worker, used when a `task` item omits `agent`. */
 const DEFAULT_AGENT_TYPE = "task";
@@ -274,11 +337,19 @@ function mapWrite(
   if (scheme === "xd") {
     return mapDeviceWrite(path.slice(DEVICE_PREFIX.length).trim(), args, resolve);
   }
-  // `local://` is the session artifact sandbox and `conflict://` replays a
-  // region the model already read; the spec table maps neither. Any other
-  // writable internal resource (`vault://`, ...) is likewise not a file write,
-  // so no path rule could apply to it.
-  if (scheme !== undefined && scheme !== "file") return NOT_MAPPED;
+  if (scheme !== undefined && scheme !== "file") {
+    if (UNWRITABLE_SCHEMES[scheme] === true) return NOT_MAPPED;
+    // A writable internal resource is a real write: omp documents `ssh://` as
+    // `write`-able and routes every registered `write` hook (`vault://`, an
+    // MCP-advertised scheme) through this same tool. The URI is kept whole so a
+    // rule can target the scheme, and it deliberately skips the resolver: a
+    // remote host or a secret store has no project-relative form, and
+    // normalizing the text would file `ssh://host/etc/passwd` under the project
+    // root as `ssh:/host/etc/passwd` — an `inside` path that does not exist.
+    // `outside` is the honest scope, so a `{"scope": "outside"}` rule claims it
+    // and an `inside` one cannot.
+    return oneCall("write_file", [{ value: path, scope: "outside" }]);
+  }
 
   const target = scheme === "file" ? stripScheme(path, scheme) : path;
   const normalized = resolve(target);
@@ -450,6 +521,19 @@ function mapAstEdit(
   return oneCall("edit_file", inputs);
 }
 
+/**
+ * Where `manage_skill` and `learn` write a managed skill. The session's real
+ * agent directory is not readable from here, so the path is best-effort: the
+ * relocation variable when it is set, and omp's default otherwise. The
+ * `write_file` / `delete_path` rules apply to whichever it is.
+ */
+function managedSkillPath(name: string): string {
+  // An empty variable counts as unset, exactly as `discoverConfigPaths` reads it.
+  const relocated = process.env[AGENT_DIR_ENV];
+  const agentDir = relocated === undefined || relocated === "" ? DEFAULT_AGENT_DIR : relocated;
+  return `${agentDir}/managed-skills/${name}/SKILL.md`;
+}
+
 function mapManageSkill(
   args: Readonly<Record<string, unknown>>,
   resolve: PathResolver,
@@ -464,9 +548,25 @@ function mapManageSkill(
   if (name === undefined || (!isDelete && action !== "create" && action !== "update")) {
     return oneCall(virtualTool, EMPTY_INPUTS);
   }
-  return oneCall(virtualTool, [
-    toPathInput(resolve(`${MANAGED_SKILLS_ROOT}/${name}/SKILL.md`)),
-  ]);
+  return oneCall(virtualTool, [toPathInput(resolve(managedSkillPath(name)))]);
+}
+
+/**
+ * `learn` stores a lesson and, with a `skill` argument, writes the very same
+ * `<agent-dir>/managed-skills/<name>/SKILL.md` that `manage_skill` is gated
+ * for — `create` and `update` both write it. A lesson on its own reaches only
+ * the memory backend's own store, which no path rule describes; that is why
+ * `memory_edit`'s `update` is not mapped either.
+ */
+function mapLearn(
+  args: Readonly<Record<string, unknown>>,
+  resolve: PathResolver,
+): MappingResult {
+  const skill = args["skill"];
+  if (!isRecord(skill)) return NOT_MAPPED;
+  const name = stringArg(skill, "name");
+  if (name === undefined) return oneCall("write_file", EMPTY_INPUTS);
+  return oneCall("write_file", [toPathInput(resolve(managedSkillPath(name)))]);
 }
 
 function mapMemoryEdit(args: Readonly<Record<string, unknown>>): MappingResult {
@@ -496,7 +596,7 @@ function mapHub(
   if (op === "start") {
     const application = stringArg(args, "application");
     if (application === undefined) return oneCall("terminal", EMPTY_INPUTS);
-    return commandCalls(joinCommand(application, args["args"]), resolve);
+    return commandCalls(launchCommand(application, args), resolve);
   }
   // `list`, `jobs`, `inbox`, `wait`, `ps`, `logs` and `describe` read state, and
   // `cancel` / `stop` / `restart` only address a process whose launch line was
@@ -527,16 +627,32 @@ function mapDebug(
   if (action === "launch" || action === "attach") {
     const program = stringArg(args, "program");
     if (program === undefined) return oneCall("terminal", EMPTY_INPUTS);
-    return commandCalls(joinCommand(program, args["args"]), resolve);
+    return commandCalls(launchCommand(program, args), resolve);
   }
   // `Object.hasOwn` because the action is untrusted: an inherited
   // `Object.prototype` member must not resolve to an argument name.
   const key = Object.hasOwn(DEBUG_COMMAND_ARGS, action) ? DEBUG_COMMAND_ARGS[action] : undefined;
-  if (key === undefined) return NOT_MAPPED;
-  const command = stringArg(args, key);
-  return command === undefined
-    ? oneCall("terminal", EMPTY_INPUTS)
-    : commandCalls(command, resolve);
+  if (key !== undefined) {
+    const command = stringArg(args, key);
+    return command === undefined
+      ? oneCall("terminal", EMPTY_INPUTS)
+      : commandCalls(command, resolve);
+  }
+  // `write_memory` overwrites the memory of a running process, which is
+  // arbitrary mutation of whatever that program does next. Neither a base64
+  // payload nor an address is text a rule could read, so only `terminal`'s
+  // `default` applies — the treatment a `hub send` key sequence already gets.
+  if (action === DEBUG_WRITE_MEMORY) return oneCall("terminal", EMPTY_INPUTS);
+  if (DEBUG_EXPRESSION_ACTIONS[action] === true) {
+    const expressions: DecisionInput[] = [];
+    for (const name of DEBUG_EXPRESSION_ARGS) {
+      const expression = stringArg(args, name);
+      if (expression !== undefined) expressions.push({ value: expression });
+    }
+    // A breakpoint without a condition evaluates nothing and stays unmapped.
+    if (expressions.length > 0) return oneCall("terminal", expressions);
+  }
+  return NOT_MAPPED;
 }
 
 /**
@@ -549,24 +665,80 @@ function mapDebug(
  *
  * Splitting into sub-commands stays in the decision step, which needs Zed's
  * ANY/ALL semantics for it; only the targets are needed here, and a command the
- * splitter cannot read with confidence contributes none. A `>` that was never
- * meant as a redirection (a comparison inside a `debug evaluate` expression)
- * therefore costs an extra path check, which is the safe direction to err in.
+ * splitter cannot read with confidence contributes none.
  */
 function commandCalls(command: string, resolve: PathResolver): MappingResult {
   const terminal: MappedCall = { virtualTool: "terminal", inputs: [{ value: command }] };
   const split = splitCommand(command);
-  if (split === undefined || split.redirects.length === 0) return { calls: [terminal] };
+  if (split === undefined) return { calls: [terminal] };
 
   const targets: DecisionInput[] = [];
-  for (const target of split.redirects) targets.push(toPathInput(resolve(target)));
+  for (const target of split.redirects) {
+    // `(( a > 10 ))` and `[[ $a > $b ]]` are an arithmetic evaluation and a
+    // test, not redirections, and nothing in the text distinguishes them from
+    // one. Their right-hand side names no file, so resolving it emits a
+    // `write_file` call for `10` or for `$b` — which reads as a project-relative
+    // name, comes back `escaped`, and makes an arithmetic comparison prompt.
+    // What is left after the expansions are removed is the test: a target that
+    // keeps literal path text (`$HOME/.ssh/authorized_keys`) is a real
+    // redirection and the resolver reports it as unexpanded, while one that is
+    // nothing but an expansion or a number is dropped. Neither case costs
+    // coverage on the `terminal` side, which sees the whole command string and,
+    // in the decision step, one `> <target>` input per redirect.
+    const literal = target.replace(EXPANSIONS, "");
+    if (literal === "" || NUMERIC_TARGET.test(literal)) continue;
+    targets.push(toPathInput(resolve(target)));
+  }
+  if (targets.length === 0) return { calls: [terminal] };
   return { calls: [terminal, { virtualTool: "write_file", inputs: targets }] };
 }
 
-/** `application` / `program` plus argv, as the one string a rule would match. */
-function joinCommand(head: string, rawArgs: unknown): string {
-  if (!Array.isArray(rawArgs)) return head;
-  let command = head;
+/** A redirect target that is nothing but digits, so it names no file. */
+const NUMERIC_TARGET = /^[0-9]+$/;
+/** The expansions the splitter keeps as source text, for stripping them out. */
+const EXPANSIONS = /\$\{[^}]*\}|\$\([^)]*\)|`[^`]*`|\$[\w@*#?$!-]+/g;
+/** Characters a value may carry and still be one shell word without quotes. */
+const SAFE_VALUE = /^[A-Za-z0-9_@%+=:,./-]*$/;
+
+/**
+ * A launch spec as the one string a rule sees: `PWD=<cwd> NAME=value … head args`.
+ *
+ * A launch is not just a command line. `NODE_OPTIONS`, `BASH_ENV`, `LD_PRELOAD`
+ * and `DYLD_INSERT_LIBRARIES` load attacker-chosen code into an innocuous
+ * `node -v`, and `cwd` decides which file a relative program name resolves to,
+ * so both belong in what the `terminal` rules match. They go in front, in the
+ * shell's own assignment-prefix shape, so that a rule anchored with `^` cannot
+ * be satisfied by hiding the payload in the environment: `^node -v$` stops
+ * matching once `NODE_OPTIONS` is set. Keys are sorted, so the string does not
+ * depend on the order the arguments happened to arrive in.
+ */
+function launchCommand(head: string, args: Readonly<Record<string, unknown>>): string {
+  const assignments: [string, string][] = [];
+  const cwd = stringArg(args, "cwd");
+  if (cwd !== undefined && cwd !== "") assignments.push([CWD_NAME, cwd]);
+  const env = args["env"];
+  if (isRecord(env)) {
+    for (const name of Object.keys(env).sort()) {
+      const value = env[name];
+      if (typeof value === "string") assignments.push([name, value]);
+    }
+  }
+
+  let command = "";
+  for (const [name, value] of assignments) {
+    // A value outside the safe set is single quoted so that it stays one word:
+    // an unquoted space would end the assignment run, putting the value's own
+    // tail where the decision step looks for the command name, and a `>` or
+    // `&&` inside a value would read there as a redirection or an operator. The
+    // decision step judges unquoted word text, so the quotes take nothing away
+    // from what a rule can match.
+    const safe = SAFE_VALUE.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+    command += `${name}=${safe} `;
+  }
+  command += head;
+
+  const rawArgs = args["args"];
+  if (!Array.isArray(rawArgs)) return command;
   for (const arg of rawArgs as readonly unknown[]) {
     if (typeof arg === "string") command += ` ${arg}`;
   }
@@ -581,6 +753,19 @@ function mapEval(): MappingResult {
 /** Arbitrary code again, this time with a page attached. */
 function mapBrowser(): MappingResult {
   return oneCall("browser", EMPTY_INPUTS);
+}
+
+/**
+ * Arbitrary code a third time, this time against the host desktop: real
+ * keyboard and pointer input into any window, the clipboard, and OS
+ * accessibility. It gets its own virtual tool with no inputs for the same
+ * reason `eval` does — a rule matched against a script would be all false
+ * positives — and omp routes the script's own `tool.<name>()` calls back
+ * through `tool_call`, so those stay individually gated. A `read_only: true`
+ * run is included: it still reads every window on the user's screen.
+ */
+function mapComputer(): MappingResult {
+  return oneCall("computer", EMPTY_INPUTS);
 }
 
 function mapTask(args: Readonly<Record<string, unknown>>): MappingResult {
@@ -630,12 +815,14 @@ const MAPPERS: Readonly<Record<string, ArgMapper>> = {
   ast_edit: mapAstEdit,
   ast_grep: mapAstGrep,
   manage_skill: mapManageSkill,
+  learn: mapLearn,
   memory_edit: mapMemoryEdit,
   bash: mapBash,
   hub: mapHub,
   debug: mapDebug,
   eval: mapEval,
   browser: mapBrowser,
+  computer: mapComputer,
   task: mapTask,
   web_search: mapWebSearch,
   lsp: mapLsp,
@@ -666,6 +853,7 @@ function toPathInput(normalized: NormalizedPath): DecisionInput {
     value: normalized.path,
     scope: normalized.scope,
     escaped: normalized.escaped,
+    unexpanded: normalized.unexpanded,
     literal: normalized.literal,
     resolved: normalized.resolved,
   };

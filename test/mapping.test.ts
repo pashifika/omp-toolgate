@@ -32,7 +32,9 @@ const SELECTOR_BEARING = [
  * Deterministic stand-in for `normalizePath`: strips a selector, expands `~`,
  * absolutizes against `/repo`, resolves `.` and `..`, then reports anything
  * under `/repo` as `inside` and relative, everything else as `outside` and
- * absolute.
+ * absolute. A target still carrying `$name`, `${…}` or `$(…)` is never `inside`,
+ * exactly as `normalizeAgainstRoot` treats one: only the shell knows where it
+ * lands.
  */
 const resolve: PathResolver = (raw: string): NormalizedPath => {
   const colon = raw.indexOf(":");
@@ -52,16 +54,18 @@ const resolve: PathResolver = (raw: string): NormalizedPath => {
     segments.push(segment);
   }
   const literal = `/${segments.join("/")}`;
-  const inside = literal === CWD || literal.startsWith(`${CWD}/`);
+  const unexpanded = /\$[\w{(]/.test(expanded);
+  const inside = !unexpanded && (literal === CWD || literal.startsWith(`${CWD}/`));
   const relative = literal.slice(CWD.length + 1);
 
   return {
     path: inside ? (relative === "" ? "." : relative) : literal,
     scope: inside ? "inside" : "outside",
-    escaped: false,
+    escaped: !inside && literal.startsWith(`${CWD}/`),
     literal,
     resolved: literal,
     selector: carriesSelector ? raw.slice(colon + 1) : undefined,
+    unexpanded,
   };
 };
 
@@ -337,6 +341,60 @@ const FILE_CASES: MapCase[] = [
     expected: [{ virtualTool: "delete_path", values: [MANAGED_SKILL] }],
   },
   {
+    // Blocker: omp documents `ssh://` as `write`-able, so the first round's
+    // premise that a non-`file` scheme is never a write was wrong.
+    case: "maps a write to a remote ssh path to write_file",
+    tool: "write",
+    input: { path: "ssh://host/etc/passwd", content: "root::0:0:::\n" },
+    expected: [{ virtualTool: "write_file", values: ["ssh://host/etc/passwd"] }],
+  },
+  {
+    case: "maps a write to a vault secret to write_file",
+    tool: "write",
+    input: { path: "vault://secret/key", content: "..." },
+    expected: [{ virtualTool: "write_file", values: ["vault://secret/key"] }],
+  },
+  {
+    // An MCP server may advertise its own writable scheme, and omp may register
+    // one later. Not knowing a scheme is no reason to leave the write ungated.
+    case: "maps a write to an unrecognized scheme to write_file",
+    tool: "write",
+    input: { path: "fleet://prod/authorized_keys", content: "..." },
+    expected: [{ virtualTool: "write_file", values: ["fleet://prod/authorized_keys"] }],
+  },
+  {
+    case: "maps a learn that writes a managed skill to that SKILL.md",
+    tool: "learn",
+    input: {
+      memory: "a lesson",
+      skill: { action: "create", name: "my-skill", description: "d", body: "b" },
+    },
+    expected: [{ virtualTool: "write_file", values: [MANAGED_SKILL] }],
+  },
+  {
+    case: "maps a learn that updates a managed skill to the same file",
+    tool: "learn",
+    input: {
+      memory: "a lesson",
+      skill: { action: "update", name: "my-skill", description: "d", body: "b" },
+    },
+    expected: [{ virtualTool: "write_file", values: [MANAGED_SKILL] }],
+  },
+  {
+    // A lesson alone reaches the memory backend's own store, like a
+    // `memory_edit` update.
+    case: "does not map a memory-only learn",
+    tool: "learn",
+    input: { memory: "a lesson", context: "from a failed build" },
+    expected: [],
+  },
+  {
+    case: "applies the write_file default for a learn skill with no name",
+    tool: "learn",
+    input: { memory: "a lesson", skill: { action: "create" } },
+    expected: [{ virtualTool: "write_file", values: [] }],
+  },
+  {
     case: "maps a memory forget to delete_path on the memory id",
     tool: "memory_edit",
     input: { op: "forget", id: "wm_42" },
@@ -372,6 +430,29 @@ const INTERNAL_READ_SCHEMES = [
   "rule",
 ];
 
+/**
+ * Schemes a `write` reaches no resource through: read-only registry entries plus
+ * `local://` (this session's artifact sandbox) and `conflict://` (a marker
+ * region inside a file the model already read).
+ */
+const UNWRITABLE_SCHEMES = [
+  "agent",
+  "artifact",
+  "conflict",
+  "history",
+  "http",
+  "https",
+  "issue",
+  "local",
+  "mcp",
+  "memory",
+  "omp",
+  "pr",
+  "rule",
+  "security",
+  "skill",
+];
+
 describe("mapToolCall: file tools", () => {
   it.each(FILE_CASES)("$case", expectMapping);
 
@@ -382,6 +463,18 @@ describe("mapToolCall: file tools", () => {
         case: scheme,
         tool: "read",
         input: { path: `${scheme}://x` },
+        expected: [],
+      });
+    },
+  );
+
+  it.each(UNWRITABLE_SCHEMES.map((scheme) => ({ scheme })))(
+    "does not map a $scheme:// write",
+    ({ scheme }) => {
+      expectMapping({
+        case: scheme,
+        tool: "write",
+        input: { path: `${scheme}://x`, content: "..." },
         expected: [],
       });
     },
@@ -502,10 +595,90 @@ const EXEC_CASES: MapCase[] = [
     expected: [{ virtualTool: "terminal", values: ["printf x > 'unclosed"] }],
   },
   {
+    // The redirect list is the splitter's best guess, and `(( ))` is arithmetic:
+    // resolving `10` as a file made an arithmetic comparison prompt under
+    // `write_file.default: confirm`.
+    case: "emits no write_file call for an arithmetic comparison",
+    tool: "bash",
+    input: { command: "(( a > 10 ))" },
+    expected: [{ virtualTool: "terminal", values: ["(( a > 10 ))"] }],
+  },
+  {
+    case: "emits no write_file call for a test comparison",
+    tool: "bash",
+    input: { command: "[[ $a > $b ]]" },
+    expected: [{ virtualTool: "terminal", values: ["[[ $a > $b ]]"] }],
+  },
+  {
+    // Nothing but an expansion: no literal text a path rule could read, and
+    // resolving it would report `/repo/$OUT` as an escape. The `terminal` side
+    // still sees the whole command, and the decision step still checks `> $OUT`.
+    case: "emits no write_file call for a redirect target that is only an expansion",
+    tool: "bash",
+    input: { command: "printf x > $OUT" },
+    expected: [{ virtualTool: "terminal", values: ["printf x > $OUT"] }],
+  },
+  {
+    // Literal path text survives the expansion, so the resolver still gets to
+    // judge it: it reads as project-relative, lands in the home directory, and
+    // comes back `outside` and unexpanded, where `\.ssh/` can deny it.
+    case: "still maps a redirect target that keeps literal path text",
+    tool: "bash",
+    input: { command: "printf x > $HOME/.ssh/authorized_keys" },
+    expected: [
+      { virtualTool: "terminal", values: ["printf x > $HOME/.ssh/authorized_keys"] },
+      { virtualTool: "write_file", values: ["/repo/$HOME/.ssh/authorized_keys"] },
+    ],
+  },
+  {
+    case: "still maps a plain redirect target to write_file",
+    tool: "bash",
+    input: { command: "printf x > out.txt" },
+    expected: [
+      { virtualTool: "terminal", values: ["printf x > out.txt"] },
+      { virtualTool: "write_file", values: ["out.txt"] },
+    ],
+  },
+  {
     case: "maps a process launch to terminal as one command string",
     tool: "hub",
     input: { op: "start", name: "web", application: "bun", args: ["run", "dev"] },
     expected: [{ virtualTool: "terminal", values: ["bun run dev"] }],
+  },
+  {
+    // Blocker: `NODE_OPTIONS` loads attacker-chosen code into an innocuous
+    // `node -v`, and `cwd` decides which file a relative program name is. Both
+    // have to be in the string the terminal rules match, in front of it, so
+    // that a `^`-anchored rule cannot be satisfied while they are set.
+    case: "judges a launch spec's environment and cwd, not just its command line",
+    tool: "hub",
+    input: {
+      op: "start",
+      name: "web",
+      application: "node",
+      args: ["-v"],
+      cwd: "/srv/app",
+      env: { NODE_OPTIONS: "--require /tmp/evil.js" },
+    },
+    expected: [
+      {
+        virtualTool: "terminal",
+        values: ["PWD=/srv/app NODE_OPTIONS='--require /tmp/evil.js' node -v"],
+      },
+    ],
+  },
+  {
+    // Sorted, so the same launch spec always produces the same string.
+    case: "sorts a launch spec's environment by name",
+    tool: "hub",
+    input: {
+      op: "start",
+      application: "node",
+      env: { LD_PRELOAD: "/tmp/x.so", BASH_ENV: "/tmp/y.sh", PORT: 8080 },
+    },
+    expected: [
+      { virtualTool: "terminal", values: ["BASH_ENV=/tmp/y.sh LD_PRELOAD=/tmp/x.so node"] },
+    ],
   },
   {
     case: "maps a redirect inside a launch line to write_file too",
@@ -572,6 +745,14 @@ const EXEC_CASES: MapCase[] = [
     expected: [{ virtualTool: "terminal", values: ["./bin/app"] }],
   },
   {
+    // A relative `program` resolves against `cwd`, so the launch line alone does
+    // not say which file is about to run.
+    case: "names a debug launch's cwd in the judged command",
+    tool: "xd://debug",
+    input: { action: "launch", program: "app", args: ["-v"], cwd: "/tmp/work" },
+    expected: [{ virtualTool: "terminal", values: ["PWD=/tmp/work app -v"] }],
+  },
+  {
     case: "does not map a debug action that drives an existing session",
     tool: "xd://debug",
     input: { action: "continue" },
@@ -597,6 +778,53 @@ const EXEC_CASES: MapCase[] = [
     expected: [{ virtualTool: "terminal", values: [] }],
   },
   {
+    // Writing into a live process is arbitrary mutation of what it does next.
+    // Neither a base64 payload nor an address is text a rule could read.
+    case: "maps a debug write_memory to terminal with no inputs",
+    tool: "xd://debug",
+    input: { action: "write_memory", memory_reference: "0x10a4c", data: "kZA=" },
+    expected: [{ virtualTool: "terminal", values: [] }],
+  },
+  {
+    case: "does not map a debug read_memory",
+    tool: "xd://debug",
+    input: { action: "read_memory", memory_reference: "0x10a4c", count: 16 },
+    expected: [],
+  },
+  {
+    // debugpy evaluates a breakpoint condition as Python on every hit.
+    case: "maps a breakpoint condition to terminal",
+    tool: "xd://debug",
+    input: {
+      action: "set_breakpoint",
+      file: "app.py",
+      line: 3,
+      condition: "__import__('os').system('rm -rf ~/Documents')",
+    },
+    expected: [
+      { virtualTool: "terminal", values: ["__import__('os').system('rm -rf ~/Documents')"] },
+    ],
+  },
+  {
+    case: "maps a data breakpoint's hit_condition to terminal",
+    tool: "xd://debug",
+    input: { action: "set_data_breakpoint", data_id: "d1", hit_condition: "system('id')" },
+    expected: [{ virtualTool: "terminal", values: ["system('id')"] }],
+  },
+  {
+    case: "does not map a breakpoint that carries no condition",
+    tool: "xd://debug",
+    input: { action: "set_breakpoint", file: "src/a.ts", line: 3 },
+    expected: [],
+  },
+  {
+    // Removing a breakpoint evaluates nothing, whatever it was created with.
+    case: "does not map a breakpoint removal",
+    tool: "xd://debug",
+    input: { action: "remove_breakpoint", file: "src/a.ts", line: 3, condition: "i > 2" },
+    expected: [],
+  },
+  {
     // `terminal.always_confirm: ["\\brm\\b"]` must never see this source text.
     case: "never matches a terminal pattern against eval source",
     tool: "eval",
@@ -616,6 +844,21 @@ const EXEC_CASES: MapCase[] = [
     tool: "xd://browser",
     input: { action: "run", code: "await tab.click('x')" },
     expected: [{ virtualTool: "browser", values: [] }],
+  },
+  {
+    // Disabled by default in omp, and completely ungated when it is on: `code`
+    // drives real keyboard input into any window on the user's desktop.
+    case: "gives computer its own virtual tool with no inputs",
+    tool: "computer",
+    input: { code: "await desktop.window({ app: 'Terminal' }).type('rm -rf ~\\n')" },
+    expected: [{ virtualTool: "computer", values: [] }],
+  },
+  {
+    // A read-only run still photographs every window on that desktop.
+    case: "gates a read-only computer run too",
+    tool: "computer",
+    input: { code: "await desktop.screenshot()", read_only: true },
+    expected: [{ virtualTool: "computer", values: [] }],
   },
   {
     case: "maps every item of a task batch to spawn_agent",
@@ -954,6 +1197,14 @@ const SCOPE_CASES: ScopeCase[] = [
     input: { command: "printf x >> ~/.ssh/authorized_keys" },
     scopes: [undefined, "outside"],
   },
+  {
+    // A remote or store-backed resource is not a project path, so an `inside`
+    // rule must not claim it and an `outside` one must.
+    case: "a write to a remote path, which is outside by construction",
+    tool: "write",
+    input: { path: "ssh://host/etc/passwd", content: "..." },
+    scopes: ["outside"],
+  },
 ];
 
 describe("mapToolCall: decision input metadata", () => {
@@ -964,7 +1215,7 @@ describe("mapToolCall: decision input metadata", () => {
     );
   });
 
-  it("carries the resolver's escape verdict and both absolute paths through", () => {
+  it("carries the resolver's verdicts and both absolute paths through", () => {
     // A repository with `config -> ~/.ssh` committed in it.
     const escaping: PathResolver = (raw) => ({
       path: `config/${raw}`,
@@ -973,6 +1224,7 @@ describe("mapToolCall: decision input metadata", () => {
       literal: `/repo/config/${raw}`,
       resolved: `/home/u/.ssh/${raw}`,
       selector: undefined,
+      unexpanded: false,
     });
     const [call] = mapToolCall("write", { path: "id_rsa", content: "x" }, escaping).calls;
     expect(call?.inputs).toStrictEqual([
@@ -980,9 +1232,38 @@ describe("mapToolCall: decision input metadata", () => {
         value: "config/id_rsa",
         scope: "inside",
         escaped: true,
+        unexpanded: false,
         literal: "/repo/config/id_rsa",
         resolved: "/home/u/.ssh/id_rsa",
       },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+const RELOCATED_SKILL = "/opt/omp-agent/managed-skills/my-skill/SKILL.md";
+
+describe("mapToolCall: managed skill location", () => {
+  it("follows PI_CODING_AGENT_DIR, the variable that relocates the agent dir", () => {
+    const before = process.env["PI_CODING_AGENT_DIR"];
+    process.env["PI_CODING_AGENT_DIR"] = "/opt/omp-agent";
+    try {
+      expectMapping({
+        case: "manage_skill",
+        tool: "manage_skill",
+        input: { action: "create", name: "my-skill", description: "d", body: "b" },
+        expected: [{ virtualTool: "write_file", values: [RELOCATED_SKILL] }],
+      });
+      expectMapping({
+        case: "learn",
+        tool: "learn",
+        input: { memory: "a lesson", skill: { action: "update", name: "my-skill" } },
+        expected: [{ virtualTool: "write_file", values: [RELOCATED_SKILL] }],
+      });
+    } finally {
+      if (before === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+      else process.env["PI_CODING_AGENT_DIR"] = before;
+    }
   });
 });

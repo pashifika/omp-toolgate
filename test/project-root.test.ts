@@ -90,6 +90,20 @@ const symlinkFixtureError = ((): string | undefined => {
     symlinkSync(proj, join(base, "proj-link"), "dir");
     // A cycle: `realpath` fails with ELOOP rather than "does not exist".
     symlinkSync(join(proj, "loop"), join(proj, "loop"), "dir");
+    // Leaves the project as a directory: <proj>/outdir -> <home>
+    symlinkSync(home, join(proj, "outdir"), "dir");
+    // Dangling, and pointing through that escaping directory link:
+    // <proj>/hop -> <proj>/outdir/.ssh/authorized_keys
+    symlinkSync(join(proj, "outdir/.ssh/authorized_keys"), join(proj, "hop"));
+    // The same target three relative hops away.
+    symlinkSync("chain2", join(proj, "chain1"));
+    symlinkSync("chain3", join(proj, "chain2"));
+    symlinkSync("outdir/.ssh/authorized_keys", join(proj, "chain3"));
+    // A cycle `realpath` reports as ENOENT rather than ELOOP, because it reaches
+    // the missing `nowhere` first: <proj>/cycle -> sink/../cycle with
+    // <proj>/sink -> nowhere, so every hop through `sink/..` returns to `cycle`.
+    symlinkSync("sink/../cycle", join(proj, "cycle"));
+    symlinkSync("nowhere", join(proj, "sink"));
     return undefined;
   } catch (error) {
     return String(error);
@@ -270,10 +284,36 @@ describe("stripSelectors", () => {
       selector: "1-10",
     },
     {
-      scenario: "a single line number",
-      raw: "src/main.ts:50",
-      path: "src/main.ts",
+      scenario: "a single line number on a file that exists",
+      raw: `${join(proj, "src/main.ts")}:50`,
+      path: join(proj, "src/main.ts"),
       selector: "50",
+    },
+    {
+      // omp writes `report:2024` to that literal name, so the tail is part of the
+      // filename until the prefix turns out to be a file that can be read by line.
+      scenario: "a bare number on a path naming no file, which stays whole",
+      raw: "report:2024",
+      path: "report:2024",
+      selector: undefined,
+    },
+    {
+      scenario: "a bare number on a missing file inside the project",
+      raw: `${join(proj, "src/missing.ts")}:50`,
+      path: `${join(proj, "src/missing.ts")}:50`,
+      selector: undefined,
+    },
+    {
+      scenario: "a range on a missing file, which names no file to begin with",
+      raw: `${join(proj, "src/missing.ts")}:50-200`,
+      path: join(proj, "src/missing.ts"),
+      selector: "50-200",
+    },
+    {
+      scenario: "two bare numbers on a path naming no file",
+      raw: "backup:12:30",
+      path: "backup:12:30",
+      selector: undefined,
     },
     {
       scenario: "an open-ended range",
@@ -505,6 +545,40 @@ describe("normalizePath", () => {
     expect(result.path).toMatch(/(^|\/)\.ssh(\/|$)/);
   });
 
+  it.each([
+    { raw: "$HOME/.ssh/authorized_keys" },
+    { raw: "${HOME}/.ssh/authorized_keys" },
+    { raw: "$(echo ~)/.ssh/authorized_keys" },
+    { raw: "$1/etc/passwd" },
+  ])("never classifies the unexpanded $raw as inside the project", ({ raw }) => {
+    const result = normalizePath(raw, proj, proj, env);
+    expect(result.scope).toBe("outside");
+    // Never a project-relative name, which is what an `inside` answer would be.
+    expect(isAbsolute(result.path)).toBe(true);
+  });
+
+  it("reports an unexpanded variable whose literal spelling is inside as an escape", () => {
+    // `> $HOME/.ssh/authorized_keys` read as `<cwd>/$HOME/.ssh/authorized_keys`
+    // with scope `inside`, while the equivalent `~/.ssh/authorized_keys` is
+    // correctly outside. Where the string lands is not knowable before something
+    // expands it, so the answer says that rather than guessing the project.
+    const result = normalizePath("$HOME/.ssh/authorized_keys", proj, proj, env);
+    expect(result.path).toBe(join(proj, "$HOME/.ssh/authorized_keys"));
+    expect(result.scope).toBe("outside");
+    expect(result.escaped).toBe(true);
+    expect(result.literal).toBe(join(proj, "$HOME/.ssh/authorized_keys"));
+  });
+
+  it("keeps a `$$` filename inside the project, whose expansion stays in place", () => {
+    // Only `$name`, `${…}` and `$(…)` can name a directory the argument leaves
+    // through; `$$` expands to the process id in the same directory, so the scope
+    // is still knowable.
+    const result = normalizePath("out.$$", proj, proj, env);
+    expect(result.path).toBe("out.$$");
+    expect(result.scope).toBe("inside");
+    expect(result.escaped).toBe(false);
+  });
+
   itWithSymlinks("resolves a symlinked project root before comparing", () => {
     const result = normalizePath(join(proj, "src/main.ts"), proj, join(base, "proj-link"), env);
     expect(result.path).toBe("src/main.ts");
@@ -616,6 +690,44 @@ describe("symlink escape", () => {
     const result = normalizePath("newdir/../link/main.ts", proj, proj, env);
     expect(result.path).toBe("src/main.ts");
   });
+
+  itWithSymlinks("resolves the target of a dangling link through the links behind it", () => {
+    // <proj>/hop -> <proj>/outdir/.ssh/authorized_keys and <proj>/outdir -> <home>.
+    // The link text was adopted as written, so `outdir` stayed unresolved: the
+    // answer read as a path inside the project, `escaped` was false, and a rule
+    // written for the real file never saw it.
+    const result = normalizePath(join(proj, "hop"), proj, proj, env);
+    expect(result.resolved).toBe(join(home, ".ssh/authorized_keys"));
+    expect(result.path).toBe(join(home, ".ssh/authorized_keys"));
+    expect(result.scope).toBe("outside");
+    expect(result.escaped).toBe(true);
+    expect(result.path).toMatch(/(^|\/)\.ssh(\/|$)/);
+  });
+
+  itWithSymlinks("follows a chain of dangling links to the end of the chain", () => {
+    const result = normalizePath(join(proj, "chain1"), proj, proj, env);
+    expect(result.resolved).toBe(join(home, ".ssh/authorized_keys"));
+    expect(result.scope).toBe("outside");
+    expect(result.escaped).toBe(true);
+  });
+
+  itWithSymlinks("ends a dangling link cycle at the hop cap and keeps the name literal", () => {
+    // <proj>/cycle -> sink/../cycle with <proj>/sink -> nowhere missing: reading
+    // `sink` lands on a name that does not exist, `..` returns to the project and
+    // `cycle` is read again. Only the hop cap ends that, and reaching this
+    // assertion at all is what proves it terminates.
+    const result = normalizePath(join(proj, "cycle"), proj, proj, env);
+    expect(result.resolved).toBe(join(proj, "cycle"));
+    expect(result.scope).toBe("inside");
+    expect(result.path).toBe("cycle");
+  });
+
+  itWithSymlinks("terminates on a self-referential link and keeps the name literal", () => {
+    const result = normalizePath(join(proj, "loop"), proj, proj, env);
+    expect(result.resolved).toBe(join(proj, "loop"));
+    expect(result.path).toBe("loop");
+    expect(result.scope).toBe("inside");
+  });
 });
 
 describe("createPathResolver", () => {
@@ -624,6 +736,10 @@ describe("createPathResolver", () => {
     expect(resolvePath("main.ts").path).toBe("src/main.ts");
     expect(resolvePath("../.env").path).toBe(".env");
     expect(resolvePath("main.ts:50-200").selector).toBe("50-200");
+    expect(resolvePath("main.ts:50").selector).toBe("50");
+    // `report:2024` names no file, so the tail is part of the name omp writes.
+    expect(resolvePath("report:2024").selector).toBeUndefined();
+    expect(resolvePath("report:2024").path).toBe("src/report:2024");
   });
 
   it("expands a tilde with the captured env", () => {
@@ -631,6 +747,9 @@ describe("createPathResolver", () => {
     expect(resolvePath("~/.ssh/id_rsa").path).toBe(join(home, ".ssh/id_rsa"));
     expect(resolvePath("~").path).toBe(home);
     expect(resolvePath("~").scope).toBe("outside");
+    // The existence check behind a bare line number expands `~` the same way.
+    expect(resolvePath("~/.ssh/id_rsa:1").path).toBe(join(home, ".ssh/id_rsa"));
+    expect(resolvePath("~/.ssh/id_rsa:1").selector).toBe("1");
   });
 
   itWithSymlinks("canonicalizes a symlinked project root once", () => {
