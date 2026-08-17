@@ -349,6 +349,20 @@ const FILE_CASES: MapCase[] = [
     expected: [{ virtualTool: "write_file", values: ["ssh://host/etc/passwd"] }],
   },
   {
+    // The write side gates `ssh://`, so the read side must too — otherwise the
+    // gate governs putting content on a remote host but not taking it off one.
+    case: "maps a read of a remote ssh path to read_file",
+    tool: "read",
+    input: { path: "ssh://host/etc/passwd" },
+    expected: [{ virtualTool: "read_file", values: ["ssh://host/etc/passwd"] }],
+  },
+  {
+    case: "does not map a read of a tool device, which returns documentation",
+    tool: "read",
+    input: { path: "xd://lsp" },
+    expected: [],
+  },
+  {
     case: "maps a write to a vault secret to write_file",
     tool: "write",
     input: { path: "vault://secret/key", content: "..." },
@@ -425,7 +439,6 @@ const INTERNAL_READ_SCHEMES = [
   "pr",
   "omp",
   "mcp",
-  "ssh",
   "xd",
   "rule",
 ];

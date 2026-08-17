@@ -453,9 +453,23 @@ function mapRead(
     const relative = rest.includes("/") ? rest : `${rest}/SKILL.md`;
     return oneCall("skill", [toPathInput(resolve(relative))]);
   }
+  // A scheme that reaches a real filesystem reads a real file, so it is gated as
+  // one: `read ssh://host/etc/passwd` returns that host's file. The write side
+  // already treats these as `write_file`; leaving the read side open would gate
+  // putting content there but not taking content out.
+  // `xd://<device>` is excluded: reading one returns the device's documentation,
+  // not a file. Writing to it is a tool dispatch, handled far earlier.
+  if (
+    scheme !== undefined &&
+    scheme !== "file" &&
+    scheme !== "xd" &&
+    UNWRITABLE_SCHEMES[scheme] !== true
+  ) {
+    return oneCall("read_file", [{ value: path, scope: "outside" }]);
+  }
   // Every other internal URI (`agent://`, `artifact://`, `local://`,
   // `memory://`, `history://`, `issue://`, `pr://`, `omp://`, `mcp://`,
-  // `ssh://`, `xd://`, `rule://`, ...) reads a resource no path rule describes.
+  // `xd://`, `rule://`, ...) reads a resource no path rule describes.
   // `file://` is not one of them: omp expands it to a local path.
   if (scheme !== undefined && scheme !== "file") return NOT_MAPPED;
 
