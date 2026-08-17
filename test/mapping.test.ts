@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { canonicalizeToolName, mapToolCall, parseHashline } from "../src/mapping.ts";
+import { canonicalizeToolName, EMITTED_VIRTUAL_TOOLS, mapToolCall, parseHashline } from "../src/mapping.ts";
 import type { HashlineSection } from "../src/mapping.ts";
 import type { NormalizedPath, PathResolver, PathScope } from "../src/types.ts";
 
@@ -1152,6 +1152,55 @@ describe("mapToolCall: unmapped calls", () => {
   );
 
   it.each(UNMAPPED_CASES)("$case", expectMapping);
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * One real call per name in `EMITTED_VIRTUAL_TOOLS`.
+ *
+ * `tsc` proves the other direction — every emission site is typed against the
+ * constant, so nothing outside it can be emitted. This table proves the
+ * constant holds no name that nothing emits, which is what makes the
+ * configuration warning and the sample check honest rather than merely strict.
+ */
+const EMISSION_CASES: readonly { readonly name: string; readonly tool: string; readonly input: unknown }[] = [
+  { name: "write_file", tool: "write", input: { path: "a.txt", content: "x" } },
+  { name: "edit_file", tool: "edit", input: { input: "[a.ts#1a2b]\nPUT 1.=1:\n+x" } },
+  { name: "delete_path", tool: "edit", input: { input: "[a.ts#1a2b]\nREM" } },
+  { name: "move_path", tool: "edit", input: { input: "[a.ts#1a2b]\nMV b.ts" } },
+  { name: "read_file", tool: "read", input: { path: "a.txt" } },
+  { name: "fetch", tool: "read", input: { path: "https://example.com" } },
+  { name: "skill", tool: "read", input: { path: "skill://my-skill" } },
+  { name: "find_path", tool: "glob", input: { path: "src" } },
+  { name: "grep", tool: "grep", input: { pattern: "TODO" } },
+  { name: "terminal", tool: "bash", input: { command: "ls" } },
+  { name: "spawn_agent", tool: "task", input: { task: "do the thing" } },
+  { name: "web_search", tool: "web_search", input: { query: "omp" } },
+  { name: "eval", tool: "eval", input: { language: "py", code: "1" } },
+  { name: "browser", tool: "browser", input: { action: "open" } },
+  { name: "computer", tool: "computer", input: {} },
+];
+
+describe("EMITTED_VIRTUAL_TOOLS", () => {
+  it.each(EMISSION_CASES)("$name is emitted by a real call", ({ name, tool, input }) => {
+    const result = mapToolCall(tool, input, resolve);
+
+    expect(result.calls.map((call) => call.virtualTool)).toContain(name);
+  });
+
+  it("holds no name this table does not cover", () => {
+    expect(EMISSION_CASES.map((entry) => entry.name).sort()).toStrictEqual(
+      Object.keys(EMITTED_VIRTUAL_TOOLS).sort(),
+    );
+  });
+
+  it("leaves the MCP form outside the set, since any server name is accepted", () => {
+    const result = mapToolCall("mcp__context7__query_docs", { query: "x" }, resolve);
+
+    expect(result.calls.map((call) => call.virtualTool)).toStrictEqual(["mcp:context7:query_docs"]);
+    expect(Object.hasOwn(EMITTED_VIRTUAL_TOOLS, "mcp:context7:query_docs")).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

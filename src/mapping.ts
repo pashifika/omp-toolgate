@@ -61,6 +61,70 @@ export function canonicalizeToolName(name: string): string {
   return `${MCP_ID_PREFIX}${rest.slice(0, separator)}:${tool}`;
 }
 
+/**
+ * Every virtual tool name this module can emit. The mapping implementation is
+ * the only honest source of this set, and two callers need it: `src/config.ts`
+ * reports a `tools` key that no call can ever be classified as, and
+ * `test/samples.test.ts` holds the published sample to the same set. Keeping the
+ * list in either of those places would leave it silently wrong the first time a
+ * mapping is added, which is what {@link VirtualTool} exists to prevent.
+ *
+ * `mcp:<server>:<tool>` is deliberately absent: the mapping accepts any server
+ * and tool name, so that half of the surface stays dynamic.
+ */
+export const EMITTED_VIRTUAL_TOOLS = {
+  write_file: true,
+  edit_file: true,
+  delete_path: true,
+  move_path: true,
+  read_file: true,
+  fetch: true,
+  skill: true,
+  find_path: true,
+  grep: true,
+  terminal: true,
+  spawn_agent: true,
+  web_search: true,
+  eval: true,
+  browser: true,
+  computer: true,
+} as const satisfies Readonly<Record<string, true>>;
+
+/** One key of {@link EMITTED_VIRTUAL_TOOLS}. */
+export type EmittedVirtualTool = keyof typeof EMITTED_VIRTUAL_TOOLS;
+
+/** An MCP tool's virtual name, which carries the server and tool it names. */
+type McpVirtualTool = `${typeof MCP_ID_PREFIX}${string}`;
+
+/**
+ * What a mapping may emit. Every emission site below is typed against this, so
+ * adding a mapping without adding its name to {@link EMITTED_VIRTUAL_TOOLS}
+ * fails to compile rather than producing a name nothing can validate.
+ */
+type VirtualTool = EmittedVirtualTool | McpVirtualTool;
+
+/** A {@link MappedCall} whose name is narrowed to what this module may emit. */
+interface Emission extends MappedCall {
+  readonly virtualTool: VirtualTool;
+}
+
+/**
+ * Whether any omp call can be classified as `name` — either one of the emitted
+ * names or an MCP tool, whose server and tool names are not knowable here.
+ *
+ * `src/config.ts` reports a configuration key for which this is false: such a
+ * rule looks protective and gates nothing. `Object.hasOwn` because the name
+ * comes from a configuration file, so an inherited `Object.prototype` member
+ * must not read as an emitted tool.
+ */
+export function isMappableVirtualTool(name: string): boolean {
+  return Object.hasOwn(EMITTED_VIRTUAL_TOOLS, name) || isMcpToolName(name);
+}
+
+function isMcpToolName(name: string): name is McpVirtualTool {
+  return name.startsWith(MCP_ID_PREFIX);
+}
+
 // ---------------------------------------------------------------------------
 // Hashline parsing
 // ---------------------------------------------------------------------------
@@ -286,7 +350,7 @@ export function mapToolCall(
   resolve: PathResolver,
 ): MappingResult {
   const canonical = canonicalizeToolName(toolName);
-  if (canonical.startsWith(MCP_ID_PREFIX)) return mapMcpCall(canonical, input);
+  if (isMcpToolName(canonical)) return mapMcpCall(canonical, input);
   const key = canonical.startsWith(DEVICE_PREFIX)
     ? canonical.slice(DEVICE_PREFIX.length)
     : canonical;
@@ -302,7 +366,7 @@ export function mapToolCall(
  * every string in its argument object, however deeply nested, as a non-path
  * input. Nothing else is known about an arbitrary server's schema.
  */
-function mapMcpCall(virtualTool: string, input: unknown): MappingResult {
+function mapMcpCall(virtualTool: McpVirtualTool, input: unknown): MappingResult {
   const inputs: DecisionInput[] = [];
   collectStrings(input, inputs);
   return oneCall(virtualTool, inputs);
@@ -406,15 +470,16 @@ function mapEdit(
 
   const sections = parseHashline(raw);
   if (sections === undefined) {
+    const call: Emission = { virtualTool: "edit_file", inputs: EMPTY_INPUTS };
     return {
-      calls: [{ virtualTool: "edit_file", inputs: EMPTY_INPUTS }],
+      calls: [call],
       warning: `edit carried no [PATH#TAG] section heading; only the edit_file default applies.`,
     };
   }
 
   // One call can edit, delete and move at once, so group the sections by
   // virtual tool and let the caller take the most restrictive outcome.
-  const grouped = new Map<string, DecisionInput[]>();
+  const grouped = new Map<VirtualTool, DecisionInput[]>();
   for (const section of sections) {
     let inputs = grouped.get(section.op);
     if (inputs === undefined) {
@@ -426,7 +491,7 @@ function mapEdit(
     if (section.dest !== undefined) inputs.push(toPathInput(resolve(section.dest)));
   }
 
-  const calls: MappedCall[] = [];
+  const calls: Emission[] = [];
   for (const [virtualTool, inputs] of grouped) calls.push({ virtualTool, inputs });
   return { calls };
 }
@@ -682,7 +747,7 @@ function mapDebug(
  * splitter cannot read with confidence contributes none.
  */
 function commandCalls(command: string, resolve: PathResolver): MappingResult {
-  const terminal: MappedCall = { virtualTool: "terminal", inputs: [{ value: command }] };
+  const terminal: Emission = { virtualTool: "terminal", inputs: [{ value: command }] };
   const split = splitCommand(command);
   if (split === undefined) return { calls: [terminal] };
 
@@ -704,7 +769,8 @@ function commandCalls(command: string, resolve: PathResolver): MappingResult {
     targets.push(toPathInput(resolve(target)));
   }
   if (targets.length === 0) return { calls: [terminal] };
-  return { calls: [terminal, { virtualTool: "write_file", inputs: targets }] };
+  const writes: Emission = { virtualTool: "write_file", inputs: targets };
+  return { calls: [terminal, writes] };
 }
 
 /** A redirect target that is nothing but digits, so it names no file. */
@@ -846,7 +912,7 @@ const MAPPERS: Readonly<Record<string, ArgMapper>> = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function oneCall(virtualTool: string, inputs: readonly DecisionInput[]): MappingResult {
+function oneCall(virtualTool: VirtualTool, inputs: readonly DecisionInput[]): MappingResult {
   return { calls: [{ virtualTool, inputs }] };
 }
 
@@ -855,7 +921,7 @@ function oneCall(virtualTool: string, inputs: readonly DecisionInput[]): Mapping
  * shape this mapping does not understand. It still gets a `default`-only
  * decision, never an implicit allow.
  */
-function missingArg(tool: string, arg: string, virtualTool: string): MappingResult {
+function missingArg(tool: string, arg: string, virtualTool: EmittedVirtualTool): MappingResult {
   return {
     calls: [{ virtualTool, inputs: EMPTY_INPUTS }],
     warning: `${tool} was called without a string "${arg}"; only the ${virtualTool} default applies.`,
