@@ -1,7 +1,8 @@
 {
   "name": "omp-toolgate",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Regex-based tool permission gate for omp. Ports the decision semantics of Zed's agent.tool_permissions and adds a project_root boundary.",
   "omp": {
