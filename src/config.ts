@@ -51,9 +51,6 @@ const PROJECT_DIR = ".omp";
 /** Environment variable that relocates the agent directory. */
 const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 
-/** Prefix on every warning, so a notification says who is complaining. */
-const WARNING_PREFIX = "omp-toolgate";
-
 /** Global `default` when a file exists but none sets it (design D9). */
 const IMPLIED_GLOBAL_DEFAULT: ToolPermissionMode = "confirm";
 
@@ -175,7 +172,7 @@ export function loadPermissions(
       .map((entry) => `${entry.origin} "${entry.pattern}": ${entry.message}`)
       .join("; ");
     warnings.push(
-      `${WARNING_PREFIX}: tool "${name}" has ${invalid.length} invalid pattern(s) and denies every call (${detail})`,
+      `tool "${name}" has ${invalid.length} invalid pattern(s) and denies every call (${detail})`,
     );
   }
 
@@ -693,7 +690,7 @@ function strictest(a: ToolPermissionMode, b: ToolPermissionMode): ToolPermission
 // ---------------------------------------------------------------------------
 
 function fileWarning(file: string, detail: string): string {
-  return `${WARNING_PREFIX}: ${file}: ${detail}`;
+  return `${file}: ${detail}`;
 }
 
 /**

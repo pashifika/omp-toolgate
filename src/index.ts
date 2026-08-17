@@ -107,11 +107,11 @@ export default function ompToolgate(pi: ExtensionApi): void {
     return state;
   }
 
-  /** Notifies each distinct message once per session. */
+  /** Notifies each distinct message once per session, prefixed exactly once. */
   function announce(ctx: ExtensionContext, message: string): void {
     if (announced.has(message)) return;
     announced.add(message);
-    ctx.ui.notify(`toolgate: ${message}`, "warn");
+    ctx.ui.notify(`omp-toolgate: ${message}`, "warn");
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -183,7 +183,7 @@ export default function ompToolgate(pi: ExtensionApi): void {
         // Reload so the recorded pattern takes effect immediately.
         current.loaded = loadPermissions(current.projectRoot, process.env, parser);
         ctx.ui.notify(
-          `toolgate: ${result === "duplicate" ? "already present" : "recorded"} ${choice.pattern} for ${decision.virtualTool} in ${choice.file}`,
+          `omp-toolgate: ${result === "duplicate" ? "already present" : "recorded"} ${choice.pattern} for ${decision.virtualTool} in ${choice.file}`,
           "info",
         );
       }
