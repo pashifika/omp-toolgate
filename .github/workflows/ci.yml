@@ -53,8 +53,10 @@ jobs:
       - run: bun run --bun test
 
   # Proves the install command the README documents actually resolves on a clean
-  # machine, and that the installed tree exposes a loadable extension entry —
-  # the same thing omp's plugin installer validates before enabling a plugin.
+  # machine, that the installed tree exposes a loadable extension entry — the
+  # same thing omp's plugin installer validates before enabling a plugin — and
+  # that the tree carries the baseline policy the README points a reader at,
+  # still loading clean through the extension's own loader.
   #
   # Not a pull-request job: it installs by ref, and a pull request's merge ref
   # does not exist on the remote as an installable ref. It therefore runs on
@@ -81,7 +83,31 @@ jobs:
           echo "installing $SPEC"
           bun add "$SPEC"
           cat > check.ts <<'TS'
-          import { readFileSync } from "node:fs";
+          import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+          import { tmpdir } from "node:os";
+          import { join } from "node:path";
+
+          /**
+           * The slice of the installed `src/config.ts` this check uses, described
+           * structurally: the module is imported from the installed tree, so there is
+           * nothing here for tsc to check it against.
+           */
+          interface LoadedSample {
+            readonly warnings: readonly string[];
+            readonly permissions:
+              | {
+                  readonly tools: Record<
+                    string,
+                    { readonly invalidPatterns: readonly { readonly pattern: string }[] }
+                  >;
+                }
+              | undefined;
+          }
+          type LoadPermissions = (
+            projectRoot: string,
+            env: NodeJS.ProcessEnv,
+            parse: (text: string) => unknown,
+          ) => LoadedSample;
 
           const manifestPath = "node_modules/omp-toolgate/package.json";
           const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -100,6 +126,63 @@ jobs:
             }
             console.log(`ok ${entry} -> ${module.default.name}`);
           }
+
+          // The README tells a reader to copy the baseline policy to their global
+          // configuration path, so a reader who has already installed the plugin must
+          // find it in the tree they installed. A packaging change can drop a file
+          // without changing it, which is why this is asserted about the artifact.
+          const sample = "samples/tool-permissions.json";
+          const samplePath = `node_modules/omp-toolgate/${sample}`;
+          if (!existsSync(samplePath)) {
+            throw new Error(`the installed tree does not contain ${samplePath}`);
+          }
+
+          // Loaded the way the shipped extension loads it: through its own loader, with
+          // the parser src/index.ts prefers under Bun, from the global path a reader
+          // would copy it to.
+          const parse = (Bun as unknown as { JSON5?: { parse?: (text: string) => unknown } })
+            .JSON5?.parse;
+          if (typeof parse !== "function") {
+            throw new Error("Bun.JSON5.parse is unavailable, so the shipped parser is untested");
+          }
+          const configUrl = new URL(
+            "node_modules/omp-toolgate/src/config.ts",
+            `file://${process.cwd()}/`,
+          );
+          const { loadPermissions } = (await import(configUrl.href)) as {
+            loadPermissions: LoadPermissions;
+          };
+
+          const base = mkdtempSync(join(tmpdir(), "toolgate-install-check-"));
+          const home = join(base, "home");
+          const projectRoot = join(base, "project");
+          mkdirSync(join(home, ".omp", "agent"), { recursive: true });
+          mkdirSync(projectRoot, { recursive: true });
+          copyFileSync(samplePath, join(home, ".omp", "agent", "tool-permissions.json"));
+
+          const loaded = loadPermissions(projectRoot, { HOME: home }, parse);
+          if (loaded.warnings.length > 0) {
+            throw new Error(`${sample} loaded with warnings: ${JSON.stringify(loaded.warnings)}`);
+          }
+          const permissions = loaded.permissions;
+          if (permissions === undefined) {
+            throw new Error(`${sample} was read but did not produce a permission set`);
+          }
+          // A document the loader can read but that declares nothing yields an empty
+          // permission set with no warning — deliberate, since it keeps an empty
+          // configuration writable, and indistinguishable here from a policy that was
+          // replaced by something inert. The published baseline is not empty.
+          const tools = Object.keys(permissions.tools);
+          if (tools.length === 0) {
+            throw new Error(`${sample} loaded but declares no tool rules`);
+          }
+          const invalid = Object.entries(permissions.tools).flatMap(([tool, rules]) =>
+            rules.invalidPatterns.map((entry) => `${tool}: ${entry.pattern}`),
+          );
+          if (invalid.length > 0) {
+            throw new Error(`${sample} holds patterns that do not compile: ${invalid.join(", ")}`);
+          }
+          console.log(`ok ${sample} -> ${tools.length} tools, no warnings: ${tools.join(", ")}`);
           console.log(`installed omp-toolgate ${manifest.version} with license ${manifest.license}`);
           TS
           bun check.ts
