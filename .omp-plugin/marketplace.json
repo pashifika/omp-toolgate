@@ -10,11 +10,11 @@
     {
       "name": "omp-toolgate",
       "description": "Per-tool regex rules over tool arguments, a project_root boundary, and symlink-escape detection. Ports Zed's agent.tool_permissions semantics to omp.",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": {
         "source": "github",
         "repo": "pashifika/omp-toolgate",
-        "ref": "v1.0.0"
+        "ref": "v1.1.0"
       },
       "category": "security",
       "homepage": "https://github.com/pashifika/omp-toolgate",
