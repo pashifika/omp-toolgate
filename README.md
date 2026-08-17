@@ -31,10 +31,10 @@ omp-toolgate fills those gaps through one `tool_call` interceptor. The `project_
 
 ## Install
 
-Install the v1.0.0 release directly from GitHub:
+Install the v1.1.0 release directly from GitHub:
 
 ```bash
-omp plugin install 'github:pashifika/omp-toolgate#v1.0.0'
+omp plugin install 'github:pashifika/omp-toolgate#v1.1.0'
 ```
 
 Alternatively, add this repository's marketplace catalog. This route also enables `omp plugin discover` and `omp plugin upgrade`:
