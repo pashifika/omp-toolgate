@@ -239,6 +239,28 @@ describe("the sample produces the decisions it advertises", () => {
   });
 
   /**
+   * Round three, which reviewed the lookahead rewrite itself. Making the two
+   * terms order-independent is what makes them linear, and it cost three cases:
+   * a subcommand reached behind git's own flags, a mutating HTTP method, and
+   * `git` matched inside `.git/`. The `git` lookaheads therefore match a command
+   * word — optionally behind a path — rather than the bare substring.
+   */
+  it.each([
+    { what: "git credential behind a git flag", command: "git --no-pager credential fill", expected: "confirm" },
+    { what: "git credential behind a config override", command: "git -c x=y credential approve", expected: "confirm" },
+    { what: "a wget that deletes a resource", command: "wget --method=DELETE https://example.com/r", expected: "confirm" },
+    { what: "a wget that puts a body", command: "wget --method=PUT --body-file=x https://example.com/r", expected: "confirm" },
+    { what: "git reached through a path", command: "/usr/bin/git push", expected: "confirm" },
+    // `.git` is not the git command, so a search inside the repository metadata
+    // is ordinary work even when it mentions a gated subcommand.
+    { what: "a search for push inside .git", command: "rg push .git/hooks", expected: "allow" },
+    { what: "a grep for push inside .git", command: "grep -r push .git/hooks", expected: "allow" },
+    { what: "reading a file under .git", command: "cat .git/config", expected: "allow" },
+  ])("decides $what as $expected", ({ command, expected }) => {
+    expect(published.decide("bash", { command })).toBe(expected);
+  });
+
+  /**
    * The other half of every rule: a confirmation on an ordinary command is how a
    * gate gets switched off, so each rule that was broadened to close a bypass
    * carries the everyday commands that sit one character away from it. Four of
