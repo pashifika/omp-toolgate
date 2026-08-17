@@ -176,6 +176,14 @@ describe("the sample produces the decisions it advertises", () => {
     { what: "an ordinary assignment prefix", tool: "bash", input: { command: "CI=1 npm run build" }, expected: "allow" },
     { what: "a search", tool: "grep", input: { pattern: "TODO", path: "src" }, expected: "allow" },
     { what: "a glob", tool: "glob", input: { path: "src/**/*.ts" }, expected: "allow" },
+
+    // The three cases the header calls out by name, because they are the ones
+    // that surprise a reader: a redirect is judged as a write, `/dev/null` is
+    // not, and an `^`-anchored command rule does not fire on argument text.
+    { what: "a redirect inside the project", tool: "bash", input: { command: "echo hi > out.txt" }, expected: "allow" },
+    { what: "a redirect outside the project", tool: "bash", input: { command: "npm test > /tmp/out.log" }, expected: "confirm" },
+    { what: "a redirect to /dev/null", tool: "bash", input: { command: "npm test > /dev/null" }, expected: "allow" },
+    { what: "a commit message that merely mentions tee", tool: "bash", input: { command: "git commit -m 'remove the tee helper'" }, expected: "allow" },
   ])("decides $what as $expected", ({ tool, input, expected }) => {
     expect(published.decide(tool, input)).toBe(expected);
   });
