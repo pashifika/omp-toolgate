@@ -142,7 +142,7 @@ export default function ompToolgate(pi: ExtensionApi): void {
       if (decision.mode === "deny") {
         return {
           block: true,
-          reason: buildBlockReason(decision, "deny", current.loaded.globalPath),
+          reason: buildBlockReason(decision, "deny", current.loaded),
         };
       }
 
@@ -150,7 +150,7 @@ export default function ompToolgate(pi: ExtensionApi): void {
       if (!ctx.hasUI) {
         return {
           block: true,
-          reason: buildBlockReason(decision, "no-ui", current.loaded.globalPath),
+          reason: buildBlockReason(decision, "no-ui", current.loaded),
         };
       }
 
@@ -174,7 +174,7 @@ export default function ompToolgate(pi: ExtensionApi): void {
       if (choice === undefined || choice.kind === "deny") {
         return {
           block: true,
-          reason: buildBlockReason(decision, "user-denied", current.loaded.globalPath),
+          reason: buildBlockReason(decision, "user-denied", current.loaded),
         };
       }
       if (choice.kind === "once") return undefined;

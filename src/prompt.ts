@@ -386,14 +386,60 @@ export function planApproval(
 }
 
 /**
+ * The configuration files a session actually loaded. `LoadedPermissions`
+ * satisfies it, so the caller hands over what it already has instead of picking
+ * a file it has no information to pick.
+ */
+export interface ConfigContext {
+  readonly globalPath: string;
+  readonly projectPath: string;
+  /** Whether each file exists and could be read. */
+  readonly loaded: { readonly global: boolean; readonly project: boolean };
+}
+
+/**
+ * The configuration files a block reason should send the reader to, per cause.
+ *
+ * A rule names the file it was loaded from; a `default` names the files that are
+ * actually loaded, so the reason never points at a path that does not exist; an
+ * uncompilable pattern names every file holding one. A floor names nothing,
+ * because no edit to either file would change the outcome.
+ */
+function causedBy(cause: DecisionCause, config: ConfigContext): readonly string[] {
+  const both: string[] = [];
+  if (config.loaded.global) both.push(config.globalPath);
+  if (config.loaded.project) both.push(config.projectPath);
+
+  switch (cause.kind) {
+    case "rule":
+      return [cause.origin === "project" ? config.projectPath : config.globalPath];
+    case "invalid-pattern": {
+      const origins = cause.origins ?? [];
+      const files = [
+        ...(origins.includes("global") ? [config.globalPath] : []),
+        ...(origins.includes("project") ? [config.projectPath] : []),
+      ];
+      // An older decision carrying no origins still has to name something, and
+      // the loaded files are the honest answer.
+      return files.length === 0 ? both : files;
+    }
+    case "default":
+      return both;
+    default:
+      return [];
+  }
+}
+
+/**
  * Why a call was blocked, phrased so the model can choose its next step. Like
  * the dialog body this is read as gate output, so model-supplied parts of it are
- * rendered rather than interpolated raw.
+ * rendered rather than interpolated raw. The configuration paths are the gate's
+ * own, so they are interpolated as they are.
  */
 export function buildBlockReason(
   decision: Decision,
   kind: "deny" | "user-denied" | "no-ui",
-  configPath: string,
+  config: ConfigContext,
 ): string {
   const targets = decision.inputs.map((i) => renderText(i.value)).join(", ") || "(no input)";
   const tool = renderText(decision.virtualTool);
@@ -403,17 +449,16 @@ export function buildBlockReason(
       : kind === "user-denied"
         ? `omp-toolgate asked the user to confirm ${tool} and the user denied it`
         : `omp-toolgate requires confirmation for ${tool}, and this session has no interactive UI`;
+  const files = causedBy(decision.cause, config);
+  const configuration =
+    files.length === 0
+      ? "No tool-permissions file can lift this decision."
+      : `Configuration: ${files.join(", ")}.`;
   const tail =
     kind === "no-ui"
       ? " Approval must happen in the parent interactive session; do not retry here."
       : "";
-  return [
-    `${head}.`,
-    `Target: ${targets}.`,
-    `Cause: ${describeCause(decision)}.`,
-    `Configuration: ${configPath}.`,
-    tail,
-  ]
+  return [`${head}.`, `Target: ${targets}.`, `Cause: ${describeCause(decision)}.`, configuration, tail]
     .join(" ")
     .trim();
 }
