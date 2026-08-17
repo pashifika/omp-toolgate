@@ -190,8 +190,11 @@
         // Programs that open their own files, which no `write_file` rule can
         // see: only a shell redirection is visible as a write target. The
         // leading `NAME=value` group is there so an assignment prefix cannot
-        // step over the anchor.
-        { "pattern": "^(?:\\S+=\\S*\\s+)*(?:tee|cp|install)\\b" },
+        // step over the anchor. It is `[^\s=]+=` and not `\S+=` on purpose: a
+        // variable name cannot contain `=`, and `\S+=\S*` could split one word
+        // at any of its `=`, which multiplies across words into catastrophic
+        // backtracking on a command that ends up matching nothing.
+        { "pattern": "^(?:[^\\s=]+=\\S*\\s+)*(?:tee|cp|install)\\b" },
         { "pattern": "\\bsed\\b[^\\n]*\\s-i" },
         { "pattern": "\\b(?:python[0-9.]*|perl|ruby|node|bun|deno)\\b[^\\n]*\\s-(?:c|e)\\b" },
 
@@ -205,13 +208,13 @@
         { "pattern": "\\bgh\\s+(auth|secret|variable)\\b" },
         { "pattern": "\\baws\\s+(configure|sts|iam|secretsmanager|ssm)\\b" },
         { "pattern": "\\bgcloud\\s+auth\\b|\\baz\\s+(login|keyvault)\\b" },
-        { "pattern": "^(?:\\S+=\\S*\\s+)*security\\b" },
-        { "pattern": "^(?:\\S+=\\S*\\s+)*defaults\\s+(write|delete|import)\\b" },
-        { "pattern": "^(?:\\S+=\\S*\\s+)*(?:launchctl|crontab)\\b" },
+        { "pattern": "^(?:[^\\s=]+=\\S*\\s+)*security\\b" },
+        { "pattern": "^(?:[^\\s=]+=\\S*\\s+)*defaults\\s+(write|delete|import)\\b" },
+        { "pattern": "^(?:[^\\s=]+=\\S*\\s+)*(?:launchctl|crontab)\\b" },
 
         // Exfiltration: a copy of this machine's files going somewhere else.
-        { "pattern": "^(?:\\S+=\\S*\\s+)*(?:scp|sftp|rsync)\\b" },
-        { "pattern": "^(?:\\S+=\\S*\\s+)*(?:nc|ncat|netcat|socat)\\b" },
+        { "pattern": "^(?:[^\\s=]+=\\S*\\s+)*(?:scp|sftp|rsync)\\b" },
+        { "pattern": "^(?:[^\\s=]+=\\S*\\s+)*(?:nc|ncat|netcat|socat)\\b" },
         { "pattern": "\\b(curl|wget)\\b[^\\n]*(\\s-T\\b|--upload-file\\b)" },
         { "pattern": "\\bcurl\\b[^\\n]*(\\s-F\\b|--form\\b|(--data(-binary|-raw|-urlencode)?|\\s-d)\\s+@)" },
 
