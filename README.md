@@ -1,6 +1,6 @@
 # omp-toolgate
 
-Applies Zed-style regular-expression permissions to [omp](https://github.com/oh-my-pi) tool calls and makes filesystem decisions relative to a `project_root` boundary.
+Applies Zed-style regular-expression permissions to [omp](https://github.com/can1357/oh-my-pi) tool calls and makes filesystem decisions relative to a `project_root` boundary.
 
 omp's native approval combines a tier (`read`, `write`, or `exec`) with a mode (`always-ask`, `write`, or `yolo`), plus glob patterns for `bash`. It cannot express policies such as “confirm writes to `.env` and `*.pem`.” Its `write` and `edit` tools also have no workspace boundary, so under the default `approvalMode: yolo`, a tool call can create or delete a file anywhere without prompting.
 
